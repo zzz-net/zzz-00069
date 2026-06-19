@@ -934,6 +934,14 @@ def batch_move_shelves(db: Session, operator_account: str, operator_role: str,
         item_results.append(result_entry)
 
     if has_failure:
+        for r in item_results:
+            if r["success"]:
+                r["success"] = False
+                r["error_code"] = ErrorCode.BATCH_ROLLBACK
+                r["error_message"] = ERROR_MESSAGES[ErrorCode.BATCH_ROLLBACK]
+            r.pop("_reservation", None)
+            r.pop("_from_shelf", None)
+
         write_audit(
             db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
             "batch", None,
@@ -945,15 +953,12 @@ def batch_move_shelves(db: Session, operator_account: str, operator_role: str,
             "FAIL", ErrorCode.BATCH_ROLLBACK, ERROR_MESSAGES[ErrorCode.BATCH_ROLLBACK]
         )
         db.commit()
-        for r in item_results:
-            r.pop("_reservation", None)
-            r.pop("_from_shelf", None)
         return {
             "code": ErrorCode.BATCH_ROLLBACK,
             "message": ERROR_MESSAGES[ErrorCode.BATCH_ROLLBACK],
             "data": {
                 "success_count": 0,
-                "failed_count": sum(1 for r in item_results if not r["success"]),
+                "failed_count": len(item_results),
                 "results": item_results,
             },
         }

@@ -563,13 +563,21 @@ check("G6 冲突触发整批回滚", resp["code"] == "BATCH_ROLLBACK",
 if resp["code"] == "BATCH_ROLLBACK":
     check("G6 success_count=0", resp["data"]["success_count"] == 0,
           f"actual={resp['data']['success_count']}")
-    check("G6 failed_count=2", resp["data"]["failed_count"] >= 2,
+    check("G6 failed_count=4 (全部条目)", resp["data"]["failed_count"] == 4,
           f"actual={resp['data']['failed_count']}")
-    error_codes = [r["error_code"] for r in resp["data"]["results"] if r["error_code"]]
+    for r in resp["data"]["results"]:
+        check(f"  G6 {r['barcode']} success=False", r["success"] is False,
+              f"success={r['success']}")
+        check(f"  G6 {r['barcode']} 有 error_code", r["error_code"] is not None,
+              f"error_code={r['error_code']}")
+    error_codes = [r["error_code"] for r in resp["data"]["results"]]
     check("G6 含 BARCODE_NOT_FOUND", "BARCODE_NOT_FOUND" in error_codes,
           f"error_codes={error_codes}")
     check("G6 含 BATCH_DUPLICATE_SHELF", "BATCH_DUPLICATE_SHELF" in error_codes,
           f"error_codes={error_codes}")
+    rollback_items = [r for r in resp["data"]["results"] if r["error_code"] == "BATCH_ROLLBACK"]
+    check("G6 未落库条目标为 BATCH_ROLLBACK", len(rollback_items) == 2,
+          f"rollback_count={len(rollback_items)}")
 
 # G7: 验证回滚后 BK-BATCH-01/02/03 的架位和历史都没变
 code, resp_01 = req("GET", "/api/reservations/BK-BATCH-01/history")
@@ -612,16 +620,24 @@ code, resp = req("POST", "/api/shelf-moves/batch", {
     "operator_account": "librarian01",
     "operator_role": "librarian",
     "items": [
-        {"barcode": "BK-BATCH-05", "shelf_code": "B-01-02"},
+        {"barcode": "BK-BATCH-05", "shelf_code": "A-01-01"},
         {"barcode": "BK-BATCH-04", "shelf_code": "B-01-01"},
     ]
 })
 check("G8 终态预约触发回滚", resp["code"] == "BATCH_ROLLBACK",
       f"code={resp['code']}")
 if resp["code"] == "BATCH_ROLLBACK":
+    check("G8 success_count=0", resp["data"]["success_count"] == 0,
+          f"actual={resp['data']['success_count']}")
+    for r in resp["data"]["results"]:
+        check(f"  G8 {r['barcode']} success=False", r["success"] is False,
+              f"success={r['success']}")
     final_errs = [r["error_code"] for r in resp["data"]["results"]]
     check("G8 含 RESERVATION_ALREADY_FINAL", "RESERVATION_ALREADY_FINAL" in final_errs,
           f"error_codes={final_errs}")
+    rollback_items = [r for r in resp["data"]["results"] if r["error_code"] == "BATCH_ROLLBACK"]
+    check("G8 未落库条目标为 BATCH_ROLLBACK", len(rollback_items) >= 1,
+          f"rollback_count={len(rollback_items)}")
 
 # G9: 正常撤销 G4 的批量调架（在撤销窗口内）
 if batch_id_g4 is not None:
@@ -821,6 +837,166 @@ with urllib.request.urlopen(f"{BASE}/api/shelf-moves/export/json") as raw:
     export_json_after = json.loads(raw.read().decode("utf-8"))
 check("H7 重启后 JSON 导出条数一致", len(export_json) == len(export_json_after),
       f"before={len(export_json)}, after={len(export_json_after)}")
+
+# ----------------------------------------------------------
+# I. 独立请求验证：回滚响应与 DB 状态严格对齐
+print("\n--- I. 独立请求验证：回滚响应与 DB 状态严格对齐 ---")
+
+# I1: 导入两本新书用于独立验证
+code, resp = req("POST", "/api/reservations/import", {
+    "operator_account": "reader01",
+    "operator_role": "reader",
+    "reservations": [
+        {"barcode": "BK-VERIFY-01", "book_title": "验证书1", "isbn": "V001", "reader_account": "reader01", "reader_name": "读者一"},
+        {"barcode": "BK-VERIFY-02", "book_title": "验证书2", "isbn": "V002", "reader_account": "reader01", "reader_name": "读者一"},
+    ]
+})
+check("I1 导入验证书成功", resp["code"] == "SUCCESS" and resp["data"]["success_count"] == 2,
+      f"code={resp['code']}, success={resp['data'].get('success_count')}")
+
+# I2: 提交两条目标架位相同的请求，触发 BATCH_DUPLICATE_SHELF 回滚
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-VERIFY-01", "shelf_code": "B-01-01"},
+        {"barcode": "BK-VERIFY-02", "shelf_code": "B-01-01"},
+    ]
+})
+check("I2 重复架位触发 BATCH_ROLLBACK", resp["code"] == "BATCH_ROLLBACK",
+      f"code={resp['code']}")
+if resp["code"] == "BATCH_ROLLBACK":
+    data = resp["data"]
+    check("I2 success_count=0", data["success_count"] == 0,
+          f"actual={data['success_count']}")
+    check("I2 failed_count=2", data["failed_count"] == 2,
+          f"actual={data['failed_count']}")
+    for r in data["results"]:
+        check(f"  I2 {r['barcode']} success=False", r["success"] is False,
+              f"success={r['success']}")
+        check(f"  I2 {r['barcode']} error_code 非空", r["error_code"] is not None,
+              f"error_code={r['error_code']}")
+
+    err_map = {r["barcode"]: r["error_code"] for r in data["results"]}
+    check("I2 第一条 error_code=BATCH_ROLLBACK", err_map.get("BK-VERIFY-01") == "BATCH_ROLLBACK",
+          f"actual={err_map.get('BK-VERIFY-01')}")
+    check("I2 第二条 error_code=BATCH_DUPLICATE_SHELF", err_map.get("BK-VERIFY-02") == "BATCH_DUPLICATE_SHELF",
+          f"actual={err_map.get('BK-VERIFY-02')}")
+
+# I3: 独立查询确认两本书架位仍为空、状态仍为 IMPORTED
+for barcode in ["BK-VERIFY-01", "BK-VERIFY-02"]:
+    code, resp = req("GET", f"/api/reservations/{barcode}/history")
+    r = resp["data"]["reservation"]
+    check(f"I3 {barcode} 架位仍为空", r["shelf_code"] is None,
+          f"actual={r['shelf_code']}")
+    check(f"I3 {barcode} 状态仍为 IMPORTED", r["status"] == "IMPORTED",
+          f"actual={r['status']}")
+    hist = resp["data"]["histories"]
+    check(f"I3 {barcode} 历史仅 1 条（只有导入）", len(hist) == 1,
+          f"actual={len(hist)}")
+
+# I4: 审计日志中回滚记录的 request_data.results 里每条也是 success=False
+code, resp = req("GET", "/api/audit?action=BATCH_MOVE_SHELVES&response_status=FAIL")
+rollback_audits = resp["data"]["audit_logs"]
+target_audit = None
+for a in rollback_audits:
+    if a.get("error_code") == "BATCH_ROLLBACK" and a.get("request_data"):
+        rd = json.loads(a["request_data"]) if isinstance(a["request_data"], str) else a["request_data"]
+        if "results" in rd:
+            target_audit = rd
+            break
+check("I4 找到含 results 的回滚审计记录", target_audit is not None)
+if target_audit is not None:
+    for ar in target_audit["results"]:
+        check(f"  I4 审计 result barcode={ar['barcode']} success=False", ar["success"] is False,
+              f"success={ar['success']}")
+
+# I5: JSON/CSV 导出中也能看出没有 I2 批次（因为回滚不落库 shelf_move_batches）
+code, resp = req("GET", "/api/shelf-moves")
+batch_barcodes = []
+for b in resp["data"]["batches"]:
+    for it in b["items"]:
+        batch_barcodes.append(it["barcode"])
+check("I5 导出中无 BK-VERIFY-01 条目（未落库）", "BK-VERIFY-01" not in batch_barcodes,
+      f"found={batch_barcodes}")
+check("I5 导出中无 BK-VERIFY-02 条目（未落库）", "BK-VERIFY-02" not in batch_barcodes,
+      f"found={batch_barcodes}")
+
+# I6: 再做一次成功的批量调架，然后重启，验证响应/DB/导出一致
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-VERIFY-01", "shelf_code": "B-01-01"},
+        {"barcode": "BK-VERIFY-02", "shelf_code": "B-01-02"},
+    ],
+    "remark": "I6 成功调架后重启验证"
+})
+check("I6 批量调架成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+i6_batch_id = resp["data"]["batch_id"] if resp["code"] == "SUCCESS" else None
+
+# 记录成功后状态
+code, resp_v1_before = req("GET", "/api/reservations/BK-VERIFY-01/history")
+code, resp_v2_before = req("GET", "/api/reservations/BK-VERIFY-02/history")
+v1_shelf_before = resp_v1_before["data"]["reservation"]["shelf_code"]
+v2_shelf_before = resp_v2_before["data"]["reservation"]["shelf_code"]
+v1_status_before = resp_v1_before["data"]["reservation"]["status"]
+v2_status_before = resp_v2_before["data"]["reservation"]["status"]
+v1_hist_before = len(resp_v1_before["data"]["histories"])
+v2_hist_before = len(resp_v2_before["data"]["histories"])
+
+# I7: 重启服务
+print("  停止服务...")
+stop_service(proc)
+time.sleep(1)
+print("  重启服务...")
+proc = start_service()
+print(f"  服务已重启 (PID {proc.pid})")
+
+# I8: 重启后验证 BK-VERIFY-01/02 架位、状态、历史仍与重启前一致
+code, resp_v1_after = req("GET", "/api/reservations/BK-VERIFY-01/history")
+code, resp_v2_after = req("GET", "/api/reservations/BK-VERIFY-02/history")
+check("I8 BK-VERIFY-01 架位一致",
+      resp_v1_after["data"]["reservation"]["shelf_code"] == v1_shelf_before,
+      f"before={v1_shelf_before}, after={resp_v1_after['data']['reservation']['shelf_code']}")
+check("I8 BK-VERIFY-02 架位一致",
+      resp_v2_after["data"]["reservation"]["shelf_code"] == v2_shelf_before,
+      f"before={v2_shelf_before}, after={resp_v2_after['data']['reservation']['shelf_code']}")
+check("I8 BK-VERIFY-01 状态一致",
+      resp_v1_after["data"]["reservation"]["status"] == v1_status_before,
+      f"before={v1_status_before}, after={resp_v1_after['data']['reservation']['status']}")
+check("I8 BK-VERIFY-01 历史条数一致",
+      len(resp_v1_after["data"]["histories"]) == v1_hist_before,
+      f"before={v1_hist_before}, after={len(resp_v1_after['data']['histories'])}")
+check("I8 BK-VERIFY-02 历史条数一致",
+      len(resp_v2_after["data"]["histories"]) == v2_hist_before,
+      f"before={v2_hist_before}, after={len(resp_v2_after['data']['histories'])}")
+
+# I9: 重启后该批次仍可查到且 revocable=true（仍在撤销窗口内）
+if i6_batch_id is not None:
+    code, resp = req("GET", f"/api/shelf-moves/{i6_batch_id}")
+    check("I9 批次重启后可查到", resp["code"] == "SUCCESS",
+          f"code={resp['code']}")
+    if resp["code"] == "SUCCESS":
+        check("I9 批次仍为 COMPLETED", resp["data"]["batch"]["status"] == "COMPLETED",
+              f"status={resp['data']['batch']['status']}")
+        check("I9 批次 revocable=True", resp["data"]["revocable"] is True,
+              f"revocable={resp['data']['revocable']}")
+
+# I10: 重启后 JSON 导出含此批次，items 明细与 DB 对齐
+with urllib.request.urlopen(f"{BASE}/api/shelf-moves/export/json") as raw:
+    export_i6 = json.loads(raw.read().decode("utf-8"))
+i6_in_export = [b for b in export_i6 if b.get("batch_no") and i6_batch_id is not None and b.get("id") == i6_batch_id]
+check("I10 JSON 导出含 I6 批次", len(i6_in_export) == 1,
+      f"found={len(i6_in_export)}")
+if i6_in_export:
+    export_items = i6_in_export[0].get("items", [])
+    export_barcodes = [it["barcode"] for it in export_items]
+    check("I10 导出含 BK-VERIFY-01", "BK-VERIFY-01" in export_barcodes,
+          f"barcodes={export_barcodes}")
+    check("I10 导出含 BK-VERIFY-02", "BK-VERIFY-02" in export_barcodes,
+          f"barcodes={export_barcodes}")
 
 # ----------------------------------------------------------
 # 清理

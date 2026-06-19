@@ -556,6 +556,133 @@ curl -s http://localhost:8000/api/configs | python -m json.tool
 
 ---
 
+### 17. 批量调架：馆员整批成功 + 原子回滚 + 撤销回退
+
+先准备 2 本预约：
+
+```bash
+curl -s -X POST http://localhost:8000/api/reservations/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator_account": "reader01",
+    "operator_role": "reader",
+    "reservations": [
+      {"barcode": "BK-BATCH-A", "book_title": "批量A", "isbn": "BA", "reader_account": "reader01", "reader_name": "读者一"},
+      {"barcode": "BK-BATCH-B", "book_title": "批量B", "isbn": "BB", "reader_account": "reader01", "reader_name": "读者一"}
+    ]
+  }' | python -m json.tool
+```
+
+#### 17.1 馆员整批成功调 2 本书到不同架位
+
+```bash
+curl -s -X POST http://localhost:8000/api/shelf-moves/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+      {"barcode": "BK-BATCH-A", "shelf_code": "A-01-01"},
+      {"barcode": "BK-BATCH-B", "shelf_code": "A-01-02"}
+    ],
+    "remark": "测试批量调架"
+  }' | python -m json.tool
+```
+
+预期：
+- `code=SUCCESS`，`success_count=2`，`failed_count=0`
+- 返回 `batch_no` 和 `revoke_deadline`（默认撤销窗口 30 分钟）
+- 每条结果 `success=true`
+
+#### 17.2 含冲突触发整批回滚：同批次重复架位
+
+```bash
+curl -s -X POST http://localhost:8000/api/shelf-moves/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+      {"barcode": "BK-BATCH-A", "shelf_code": "A-02-01"},
+      {"barcode": "BK-BATCH-B", "shelf_code": "A-02-01"}
+    ]
+  }' | python -m json.tool
+```
+
+预期：
+- `code=BATCH_ROLLBACK`，`success_count=0`，`failed_count=2`
+- **关键**：两条结果的 `success` 都为 `false`，第一条 `error_code=BATCH_ROLLBACK`（通过单条校验但被整批回滚），第二条 `error_code=BATCH_DUPLICATE_SHELF`
+- BK-BATCH-A/B 的架位**仍然保持原来的 A-01-01/A-01-02**，历史无新增记录
+
+#### 17.3 撤销窗口内正常撤销
+
+```bash
+# 查询批次列表获取 batch_id
+curl -s http://localhost:8000/api/shelf-moves | python -m json.tool
+# 取 COMPLETED 批次的 id 作为 <BATCH_ID>
+
+# 执行撤销
+curl -s -X POST http://localhost:8000/api/shelf-moves/<BATCH_ID>/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"operator_account":"librarian01","operator_role":"librarian","revoke_reason":"测试撤销"}' \
+  | python -m json.tool
+```
+
+预期：
+- `code=SUCCESS`，批次 `status=REVOKED`，`revoked_count=2`
+- BK-BATCH-A/B 架位回到 `null`，状态回到 `IMPORTED`
+
+#### 17.4 读者/匿名 批量调架或撤销越权被拒
+
+```bash
+# 读者批量调架 -> PERMISSION_DENIED
+curl -s -X POST http://localhost:8000/api/shelf-moves/batch \
+  -H "Content-Type: application/json" \
+  -d '{"operator_account":"reader01","operator_role":"reader","items":[{"barcode":"BK-BATCH-A","shelf_code":"A-01-01"}]}' \
+  | python -m json.tool
+
+# 读者撤销 -> PERMISSION_DENIED
+curl -s -X POST http://localhost:8000/api/shelf-moves/<BATCH_ID>/revoke \
+  -H "Content-Type: application/json" \
+  -d '{"operator_account":"reader01","operator_role":"reader"}' \
+  | python -m json.tool
+```
+
+#### 17.5 批量调架查询与 JSON/CSV 导出
+
+```bash
+curl -s http://localhost:8000/api/shelf-moves | python -m json.tool
+curl -s http://localhost:8000/api/shelf-moves/export/json -o shelf_moves.json
+curl -s http://localhost:8000/api/shelf-moves/export/csv -o shelf_moves.csv
+```
+
+审计日志新增 action：`BATCH_MOVE_SHELVES`、`REVOKE_SHELF_MOVE`。
+
+#### 17.6 系统配置：撤销窗口持久化
+
+系统配置新增键 `shelf_move_revoke_minutes`（默认 `30`，`0` 表示不可撤销）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/configs \
+  -H "Content-Type: application/json" \
+  -d '{"operator_account":"librarian01","operator_role":"librarian","config_key":"shelf_move_revoke_minutes","config_value":"60","description":"批量调架撤销窗口（分钟）"}' \
+  | python -m json.tool
+```
+
+---
+
+### 18. 一键完整回归测试（含批量调架 + 重启一致性 + 回滚响应与 DB 状态对齐）
+
+覆盖：整批成功、同批次重复架位触发回滚且所有条目 `success=false`、终态预约触发回滚、越权被拒、撤销窗口内撤销、重复撤销被拒、超窗口被拒、重启后批次/架位/历史/审计/导出完全一致、独立请求验证回滚响应与 DB 不打架。
+
+```bash
+python test_regression.py
+```
+
+预期输出末尾：`全部 XX 项测试通过 ✓`。
+
+---
+
 ## 数据模型字段对照
 
 ### system_configs（系统配置表，取书时限持久化）
@@ -614,3 +741,25 @@ curl -s http://localhost:8000/api/configs | python -m json.tool
 
 ### shelf_rules & pickup_windows
 见原表定义：架位区排号 + 启停、取书窗口时间段。
+
+### shelf_move_batches（批量调架批次表）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | int | 主键 |
+| `batch_no` | str(50) | 批次号（唯一，格式 SM+时间戳+随机数） |
+| `operator_account / operator_role` | str | 操作馆员 |
+| `status` | str(30) | COMPLETED / REVOKED |
+| `revoke_deadline` | datetime | 撤销截止时间（创建时间 + 配置分钟数） |
+| `remark` | text | 备注 |
+| `created_at / updated_at` | datetime | 时间戳 |
+
+### shelf_move_items（批量调架明细表）
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | int | 主键 |
+| `batch_id` | int | 关联批次（外键） |
+| `barcode` | str(100) | 图书条码 |
+| `from_shelf_code` | str(50) | 原架位（可能为空） |
+| `to_shelf_code` | str(50) | 目标架位 |
+| `reservation_id` | int | 关联预约 ID |
+| `created_at` | datetime | 创建时间 |
