@@ -39,8 +39,8 @@ python test_flow.py
 | 角色标识 | 说明 | 权限 |
 |---------|------|------|
 | `reader` | 读者 | 导入预约、查看、仅可取消**本人**的预约 |
-| `librarian` | 馆员 | 全部操作，含**确认取走 / 手动过期 / 修改系统配置**（专属权限），可取消任意预约 |
-| `anonymous` | 匿名用户 | 仅可查看，取消操作一律被拒 |
+| `librarian` | 馆员 | 全部操作，含**分配架位 / 标记待取 / 确认取走 / 手动过期 / 修改系统配置**（专属权限），可取消任意预约 |
+| `anonymous` | 匿名用户 | **仅可查看**，所有写操作（导入/分配/标记/确认/取消/过期/改配置）一律被拒，返回 `PERMISSION_ANONYMOUS_FORBIDDEN` |
 
 ## 状态流转
 
@@ -84,11 +84,27 @@ SHELF_ASSIGNED / READY_FOR_PICKUP
 
 ### 0. 查看服务状态与初始化数据
 
+**根路径版本检查（与健康检查、README 一致）：**
 ```bash
 curl -s http://localhost:8000/ | python -m json.tool
 ```
 
-预期输出：版本号 `1.1.0`，`features` 中包含"过期自动回收""权限边界"等描述。
+预期输出：版本号 `1.1.0`，`features` 中包含"启动自动扫描过期""权限边界"等描述。
+
+**健康检查（返回同样的版本号 `1.1.0`）：**
+```bash
+curl -s http://localhost:8000/health | python -m json.tool
+```
+
+预期输出：
+```json
+{
+    "status": "healthy",
+    "service": "图书预约架位管理 API",
+    "version": "1.1.0",
+    "timestamp": "2026-06-20T12:34:56.789012"
+}
+```
 
 查看已预置的架位规则（首次启动自动初始化 5 条）：
 

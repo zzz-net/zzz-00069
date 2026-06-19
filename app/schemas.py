@@ -31,7 +31,7 @@ ERROR_MESSAGES = {
     ErrorCode.INVALID_STATUS_TRANSITION: "无效的状态流转",
     ErrorCode.PERMISSION_DENIED: "权限不足，仅馆员可执行此操作",
     ErrorCode.PERMISSION_NOT_OWNER: "仅预约所属读者本人或馆员可取消此预约",
-    ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN: "匿名用户无权执行取消操作，请以读者或馆员身份登录",
+    ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN: "匿名用户无权执行此操作，请以读者或馆员身份登录",
     ErrorCode.INVALID_ROLE: "无效的角色标识",
     ErrorCode.RESERVATION_NOT_FOUND: "预约记录不存在",
     ErrorCode.VALIDATION_ERROR: "请求参数校验失败",

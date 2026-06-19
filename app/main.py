@@ -9,7 +9,7 @@ import io
 import json
 import sys
 
-from app.database import engine, Base, get_db, DB_PATH
+from app.database import engine, Base, get_db, DB_PATH, SessionLocal
 from app import models, schemas, services
 
 APP_VERSION = "1.1.0"
@@ -44,7 +44,8 @@ def seed_initial_data(db: Session):
 
 
 def run_startup_tasks():
-    with next(get_db()) as db:
+    db = SessionLocal()
+    try:
         seed_initial_data(db)
         scan_result = services.scan_expired_reservations(
             db, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
@@ -56,6 +57,8 @@ def run_startup_tasks():
         else:
             print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，未发现需回收的过期预约", flush=True)
         return scan_result
+    finally:
+        db.close()
 
 
 @asynccontextmanager

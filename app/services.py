@@ -70,8 +70,19 @@ def require_librarian(role: str) -> Tuple[bool, Optional[str]]:
     ok, err = validate_role(role)
     if not ok:
         return False, err
+    if role == ROLE_ANONYMOUS:
+        return False, ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN
     if role != ROLE_LIBRARIAN:
         return False, ErrorCode.PERMISSION_DENIED
+    return True, None
+
+
+def require_authenticated(role: str) -> Tuple[bool, Optional[str]]:
+    ok, err = validate_role(role)
+    if not ok:
+        return False, err
+    if role == ROLE_ANONYMOUS:
+        return False, ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN
     return True, None
 
 
@@ -125,9 +136,15 @@ def get_default_expire_hours(db: Session) -> int:
 
 def import_reservations(db: Session, operator_account: str, operator_role: str,
                         items: List[ReservationImportItem]):
-    ok, err = validate_role(operator_role)
+    ok, err = require_authenticated(operator_role)
     if not ok:
-        return {"code": err, "message": ERROR_MESSAGES[err], "data": None}
+        write_audit(
+            db, "IMPORT_RESERVATION", operator_account, operator_role,
+            "reservation", None, None,
+            "FAIL", err, ERROR_MESSAGES.get(err, "未知错误")
+        )
+        db.commit()
+        return {"code": err, "message": ERROR_MESSAGES.get(err, "未知错误"), "data": None}
 
     success_count = 0
     failed_items = []
@@ -186,9 +203,26 @@ def import_reservations(db: Session, operator_account: str, operator_role: str,
 def assign_shelf(db: Session, operator_account: str, operator_role: str,
                  barcode: str, shelf_code: str, pickup_window_id: Optional[int] = None,
                  expire_hours: Optional[int] = None):
-    ok, err = validate_role(operator_role)
+    ok, err = require_librarian(operator_role)
     if not ok:
-        return {"code": err, "message": ERROR_MESSAGES[err], "data": None}
+        write_audit(
+            db, "ASSIGN_SHELF", operator_account, operator_role,
+            "reservation", barcode,
+            {"barcode": barcode, "shelf_code": shelf_code},
+            "FAIL", err, ERROR_MESSAGES.get(err, "未知错误")
+        )
+        db.commit()
+        return {"code": err, "message": ERROR_MESSAGES.get(err, "未知错误"), "data": None}
+
+    if expire_hours is not None and expire_hours <= 0:
+        write_audit(
+            db, "ASSIGN_SHELF", operator_account, operator_role,
+            "reservation", barcode,
+            {"barcode": barcode, "shelf_code": shelf_code, "expire_hours": expire_hours},
+            "FAIL", ErrorCode.VALIDATION_ERROR, "expire_hours 必须大于 0"
+        )
+        db.commit()
+        return {"code": ErrorCode.VALIDATION_ERROR, "message": "expire_hours 必须大于 0", "data": None}
 
     reservation = db.query(Reservation).filter(Reservation.barcode == barcode).first()
     if not reservation:
@@ -301,9 +335,15 @@ def assign_shelf(db: Session, operator_account: str, operator_role: str,
 
 
 def mark_ready_for_pickup(db: Session, operator_account: str, operator_role: str, barcode: str):
-    ok, err = validate_role(operator_role)
+    ok, err = require_librarian(operator_role)
     if not ok:
-        return {"code": err, "message": ERROR_MESSAGES[err], "data": None}
+        write_audit(
+            db, "MARK_READY", operator_account, operator_role,
+            "reservation", barcode, {"barcode": barcode},
+            "FAIL", err, ERROR_MESSAGES.get(err, "未知错误")
+        )
+        db.commit()
+        return {"code": err, "message": ERROR_MESSAGES.get(err, "未知错误"), "data": None}
 
     reservation = db.query(Reservation).filter(Reservation.barcode == barcode).first()
     if not reservation:
