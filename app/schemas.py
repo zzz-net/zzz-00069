@@ -20,6 +20,13 @@ class ErrorCode:
     PICKUP_WINDOW_NOT_FOUND = "PICKUP_WINDOW_NOT_FOUND"
     CONFIG_NOT_FOUND = "CONFIG_NOT_FOUND"
     RESERVATION_ALREADY_FINAL = "RESERVATION_ALREADY_FINAL"
+    BATCH_DUPLICATE_BARCODE = "BATCH_DUPLICATE_BARCODE"
+    BATCH_DUPLICATE_SHELF = "BATCH_DUPLICATE_SHELF"
+    BATCH_ROLLBACK = "BATCH_ROLLBACK"
+    BATCH_NOT_FOUND = "BATCH_NOT_FOUND"
+    REVOKE_WINDOW_EXPIRED = "REVOKE_WINDOW_EXPIRED"
+    BATCH_ALREADY_REVOKED = "BATCH_ALREADY_REVOKED"
+    ITEM_STATE_CHANGED = "ITEM_STATE_CHANGED"
 
 
 ERROR_MESSAGES = {
@@ -39,6 +46,13 @@ ERROR_MESSAGES = {
     ErrorCode.PICKUP_WINDOW_NOT_FOUND: "取书窗口不存在",
     ErrorCode.CONFIG_NOT_FOUND: "配置项不存在",
     ErrorCode.RESERVATION_ALREADY_FINAL: "预约已处于终态（已取走/已取消/已过期），无法变更",
+    ErrorCode.BATCH_DUPLICATE_BARCODE: "同批次内条码重复",
+    ErrorCode.BATCH_DUPLICATE_SHELF: "同批次内目标架位重复占用",
+    ErrorCode.BATCH_ROLLBACK: "批量调架存在校验失败，整批回滚",
+    ErrorCode.BATCH_NOT_FOUND: "批量调架批次不存在",
+    ErrorCode.REVOKE_WINDOW_EXPIRED: "已超出撤销窗口，无法回退",
+    ErrorCode.BATCH_ALREADY_REVOKED: "该批次已被撤销，不可重复撤销",
+    ErrorCode.ITEM_STATE_CHANGED: "批次内某条预约状态已被后续操作变更，无法安全撤销",
 }
 
 
@@ -223,3 +237,66 @@ class ExpireScanResult(BaseModel):
     scanned_count: int
     expired_count: int
     details: List[dict]
+
+
+class ShelfMoveItemRequest(BaseModel):
+    barcode: str = Field(..., max_length=100)
+    shelf_code: str = Field(..., max_length=50)
+
+
+class ShelfMoveBatchRequest(BaseModel):
+    operator_account: str
+    operator_role: str
+    items: List[ShelfMoveItemRequest]
+    remark: Optional[str] = None
+
+
+class ShelfMoveItemResult(BaseModel):
+    index: int
+    barcode: str
+    shelf_code: str
+    success: bool
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class ShelfMoveItemOut(BaseModel):
+    id: int
+    batch_id: int
+    barcode: str
+    from_shelf_code: Optional[str]
+    to_shelf_code: str
+    reservation_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ShelfMoveBatchOut(BaseModel):
+    id: int
+    batch_no: str
+    operator_account: str
+    operator_role: str
+    status: str
+    revoke_deadline: datetime
+    remark: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    items: List[ShelfMoveItemOut]
+
+    class Config:
+        from_attributes = True
+
+
+class ShelfMoveRevokeRequest(BaseModel):
+    operator_account: str
+    operator_role: str
+    revoke_reason: Optional[str] = None
+
+
+class ShelfMoveBatchQueryParams(BaseModel):
+    operator_account: Optional[str] = None
+    status: Optional[str] = None
+    created_from: Optional[datetime] = None
+    created_to: Optional[datetime] = None

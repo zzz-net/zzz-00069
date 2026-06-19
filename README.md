@@ -23,8 +23,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 4. 扫描并自动回收超过 `expire_at` 的预约（含状态历史与审计日志）
 
 启动后访问：
-- API 根路径：<http://localhost:8000/>（返回版本号 `1.1.0`）
-- 健康检查：<http://localhost:8000/health>（返回状态和版本号 `1.1.0`）
+- API 根路径：<http://localhost:8000/>（返回版本号 `1.2.0`）
+- 健康检查：<http://localhost:8000/health>（返回状态和版本号 `1.2.0`）
 - Swagger 文档：<http://localhost:8000/docs>
 - 数据库文件：项目根目录 `library.db`
 
@@ -460,7 +460,11 @@ curl -s "http://localhost:8000/api/audit?operator_account=reader002" | python -m
 - `PERMISSION_DENIED`（读者冒充馆员取书 / 读者尝试分配架位或标记待取）
 - `PERMISSION_NOT_OWNER`（reader002 取消 reader001）
 - `PERMISSION_ANONYMOUS_FORBIDDEN`（匿名用户任何写操作：导入/分配/标记/确认/取消/改配置）
-- `VALIDATION_ERROR`（expire_hours ≤ 0）
+- `VALIDATION_ERROR`（expire_hours ≤ 0 / default_expire_hours 非正整数）
+
+成功记录中可看到：
+- `SCAN_EXPIRED`（启动扫描记录，`request_data` 含 `"trigger": "startup"` 和扫描/回收计数）
+- `EXPIRE_RESERVATION`（每条自动过期的预约，含 `expire_reason` 和 `expire_at`）
 
 #### JSON 格式导出（支持同样的筛选参数）
 

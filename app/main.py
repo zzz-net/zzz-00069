@@ -12,7 +12,7 @@ import sys
 from app.database import engine, Base, get_db, DB_PATH, SessionLocal
 from app import models, schemas, services
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_NAME = "图书预约架位管理 API"
 APP_DESCRIPTION = "本地图书预约架位 JSON API - 架位规则、取书窗口、预约清单、状态历史、审计日志、过期自动回收"
 
@@ -104,7 +104,10 @@ def root():
             "取消权限边界：读者本人/馆员/匿名三种角色区分",
             "启动自动扫描过期 + 状态历史补齐 + 审计日志",
             "状态历史带架位快照，便于馆员查单",
-            "CSV/JSON 审计导出、多条件筛选查询"
+            "CSV/JSON 审计导出、多条件筛选查询",
+            "馆员批量调架 + 事务原子性整批回滚",
+            "批量调架撤销窗口（系统配置持久化）",
+            "批量调架批次查询 + JSON/CSV 导出明细"
         ]
     }
 
@@ -425,3 +428,125 @@ def list_audit_logs(
         "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
         "data": {"audit_logs": [schemas.AuditLogOut.model_validate(l).model_dump(mode="json") for l in logs]},
     }
+
+
+@app.post("/api/shelf-moves/batch", response_model=schemas.ApiResponse)
+def batch_move_shelves(data: schemas.ShelfMoveBatchRequest, db: Session = Depends(get_db)):
+    result = services.batch_move_shelves(
+        db, data.operator_account, data.operator_role, data.items, data.remark
+    )
+    if result["code"] != schemas.ErrorCode.SUCCESS:
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.post("/api/shelf-moves/{batch_id}/revoke", response_model=schemas.ApiResponse)
+def revoke_shelf_move(batch_id: int, data: schemas.ShelfMoveRevokeRequest, db: Session = Depends(get_db)):
+    result = services.revoke_shelf_move_batch(
+        db, data.operator_account, data.operator_role, batch_id, data.revoke_reason
+    )
+    if result["code"] != schemas.ErrorCode.SUCCESS:
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.get("/api/shelf-moves", response_model=schemas.ApiResponse)
+def list_shelf_move_batches(
+    operator_account: Optional[str] = None,
+    status: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.ShelfMoveBatchQueryParams(
+        operator_account=operator_account, status=status,
+        created_from=created_from, created_to=created_to,
+    )
+    batches = services.query_shelf_move_batches(db, params)
+    result_list = []
+    for b in batches:
+        batch_dict = schemas.ShelfMoveBatchOut.model_validate(b).model_dump(mode="json")
+        revocable, _ = services.is_batch_revocable(db, b)
+        batch_dict["revocable"] = revocable
+        result_list.append(batch_dict)
+    return {
+        "code": schemas.ErrorCode.SUCCESS,
+        "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
+        "data": {"batches": result_list},
+    }
+
+
+@app.get("/api/shelf-moves/{batch_id}", response_model=schemas.ApiResponse)
+def get_shelf_move_batch(batch_id: int, db: Session = Depends(get_db)):
+    result = services.get_shelf_move_batch(db, batch_id)
+    if result["code"] != schemas.ErrorCode.SUCCESS:
+        return JSONResponse(status_code=404, content=result)
+    result["data"] = {
+        "batch": schemas.ShelfMoveBatchOut.model_validate(result["data"]["batch"]).model_dump(mode="json"),
+        "revocable": result["data"]["revocable"],
+    }
+    return result
+
+
+@app.get("/api/shelf-moves/export/json")
+def export_shelf_moves_json(
+    operator_account: Optional[str] = None,
+    status: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.ShelfMoveBatchQueryParams(
+        operator_account=operator_account, status=status,
+        created_from=created_from, created_to=created_to,
+    )
+    batches = services.query_shelf_move_batches(db, params)
+    export_list = []
+    for b in batches:
+        revocable, _ = services.is_batch_revocable(db, b)
+        batch_dict = schemas.ShelfMoveBatchOut.model_validate(b).model_dump(mode="json")
+        batch_dict["revocable"] = revocable
+        export_list.append(batch_dict)
+    response = Response(
+        content=json.dumps(export_list, ensure_ascii=False, indent=2, default=str),
+        media_type="application/json",
+    )
+    response.headers["Content-Disposition"] = "attachment; filename=shelf_moves.json"
+    return response
+
+
+@app.get("/api/shelf-moves/export/csv")
+def export_shelf_moves_csv(
+    operator_account: Optional[str] = None,
+    status: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.ShelfMoveBatchQueryParams(
+        operator_account=operator_account, status=status,
+        created_from=created_from, created_to=created_to,
+    )
+    batches = services.query_shelf_move_batches(db, params)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "batch_id", "batch_no", "operator_account", "operator_role",
+        "status", "revoke_deadline", "remark", "created_at", "updated_at",
+        "item_id", "barcode", "from_shelf_code", "to_shelf_code", "reservation_id"
+    ])
+    for b in batches:
+        for it in b.items:
+            writer.writerow([
+                b.id, b.batch_no, b.operator_account, b.operator_role,
+                b.status, b.revoke_deadline.isoformat() if b.revoke_deadline else "",
+                b.remark or "", b.created_at.isoformat() if b.created_at else "",
+                b.updated_at.isoformat() if b.updated_at else "",
+                it.id, it.barcode, it.from_shelf_code or "", it.to_shelf_code, it.reservation_id,
+            ])
+    response = Response(
+        content="\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+    )
+    response.headers["Content-Disposition"] = "attachment; filename=shelf_moves.csv"
+    return response

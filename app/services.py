@@ -5,9 +5,11 @@ import json
 
 from app.models import (
     Reservation, ShelfRule, PickupWindow, StatusHistory, AuditLog, SystemConfig,
+    ShelfMoveBatch, ShelfMoveItem,
     RESERVATION_STATUS, ROLE_READER, ROLE_LIBRARIAN, ROLE_ANONYMOUS,
     CANCEL_BY_SELF, CANCEL_BY_LIBRARIAN, CANCEL_BY_ANONYMOUS,
-    EXPIRE_REASON_TIMEOUT, EXPIRE_REASON_STARTUP_SCAN, EXPIRE_REASON_MANUAL
+    EXPIRE_REASON_TIMEOUT, EXPIRE_REASON_STARTUP_SCAN, EXPIRE_REASON_MANUAL,
+    BATCH_STATUS_COMPLETED, BATCH_STATUS_REVOKED
 )
 from app.schemas import (
     ReservationImportItem, ErrorCode, ERROR_MESSAGES,
@@ -17,6 +19,8 @@ from app.schemas import (
 
 DEFAULT_EXPIRE_HOURS_KEY = "default_expire_hours"
 DEFAULT_EXPIRE_HOURS = 48
+SHELF_MOVE_REVOKE_MINUTES_KEY = "shelf_move_revoke_minutes"
+DEFAULT_SHELF_MOVE_REVOKE_MINUTES = 30
 SYSTEM_OPERATOR_ACCOUNT = "__system__"
 
 
@@ -101,6 +105,13 @@ def validate_config_value(config_key: str, config_value: str) -> Tuple[bool, Opt
             return False, ErrorCode.VALIDATION_ERROR, "default_expire_hours 必须是正整数"
         if val <= 0:
             return False, ErrorCode.VALIDATION_ERROR, "default_expire_hours 必须大于 0"
+    if config_key == SHELF_MOVE_REVOKE_MINUTES_KEY:
+        try:
+            val = int(config_value)
+        except (ValueError, TypeError):
+            return False, ErrorCode.VALIDATION_ERROR, "shelf_move_revoke_minutes 必须是非负整数"
+        if val < 0:
+            return False, ErrorCode.VALIDATION_ERROR, "shelf_move_revoke_minutes 必须大于等于 0（0 表示不可撤销）"
     return True, None, None
 
 
@@ -131,21 +142,54 @@ def get_all_configs(db: Session) -> List[SystemConfig]:
 
 
 def ensure_default_configs(db: Session):
-    existing = get_config_value(db, DEFAULT_EXPIRE_HOURS_KEY)
-    if existing is None:
+    existing_expire = get_config_value(db, DEFAULT_EXPIRE_HOURS_KEY)
+    if existing_expire is None:
         set_config_value(
             db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS),
             description="默认取书时限（小时），分配架位时 expire_hours 未指定时使用"
         )
         db.commit()
     else:
-        ok, _, _ = validate_config_value(DEFAULT_EXPIRE_HOURS_KEY, existing)
+        ok, _, _ = validate_config_value(DEFAULT_EXPIRE_HOURS_KEY, existing_expire)
         if not ok:
             set_config_value(
                 db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS),
                 description="默认取书时限（小时），分配架位时 expire_hours 未指定时使用"
             )
             db.commit()
+
+    existing_revoke = get_config_value(db, SHELF_MOVE_REVOKE_MINUTES_KEY)
+    if existing_revoke is None:
+        set_config_value(
+            db, SHELF_MOVE_REVOKE_MINUTES_KEY, str(DEFAULT_SHELF_MOVE_REVOKE_MINUTES),
+            description="批量调架撤销窗口（分钟），0 表示不可撤销"
+        )
+        db.commit()
+    else:
+        ok, _, _ = validate_config_value(SHELF_MOVE_REVOKE_MINUTES_KEY, existing_revoke)
+        if not ok:
+            set_config_value(
+                db, SHELF_MOVE_REVOKE_MINUTES_KEY, str(DEFAULT_SHELF_MOVE_REVOKE_MINUTES),
+                description="批量调架撤销窗口（分钟），0 表示不可撤销"
+            )
+            db.commit()
+
+
+def get_revoke_minutes(db: Session) -> int:
+    raw = get_config_value(db, SHELF_MOVE_REVOKE_MINUTES_KEY, str(DEFAULT_SHELF_MOVE_REVOKE_MINUTES))
+    try:
+        val = int(raw)
+        if val < 0:
+            return DEFAULT_SHELF_MOVE_REVOKE_MINUTES
+        return val
+    except Exception:
+        return DEFAULT_SHELF_MOVE_REVOKE_MINUTES
+
+
+def generate_batch_no() -> str:
+    now = datetime.utcnow()
+    import random
+    return f"SM{now.strftime('%Y%m%d%H%M%S')}{random.randint(1000, 9999)}"
 
 
 def get_default_expire_hours(db: Session) -> int:
@@ -785,3 +829,369 @@ def get_all_shelves(db: Session):
 
 def get_all_pickup_windows(db: Session):
     return db.query(PickupWindow).order_by(PickupWindow.id.asc()).all()
+
+
+def batch_move_shelves(db: Session, operator_account: str, operator_role: str,
+                       items: List, remark: Optional[str] = None):
+    ok, err = require_librarian(operator_role)
+    if not ok:
+        write_audit(
+            db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
+            "batch", None,
+            {"items": [it.model_dump() for it in items]},
+            "FAIL", err, ERROR_MESSAGES.get(err, "未知错误")
+        )
+        db.commit()
+        return {"code": err, "message": ERROR_MESSAGES.get(err, "未知错误"), "data": None}
+
+    if not items:
+        write_audit(
+            db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
+            "batch", None, {"items": []},
+            "FAIL", ErrorCode.VALIDATION_ERROR, "批量调架条目不能为空"
+        )
+        db.commit()
+        return {"code": ErrorCode.VALIDATION_ERROR, "message": "批量调架条目不能为空", "data": None}
+
+    item_results = []
+    has_failure = False
+
+    seen_barcodes = set()
+    seen_shelves = set()
+
+    for idx, item in enumerate(items):
+        barcode = item.barcode
+        shelf_code = item.shelf_code
+        result_entry = {
+            "index": idx,
+            "barcode": barcode,
+            "shelf_code": shelf_code,
+            "success": False,
+            "error_code": None,
+            "error_message": None,
+        }
+
+        if barcode in seen_barcodes:
+            result_entry["error_code"] = ErrorCode.BATCH_DUPLICATE_BARCODE
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.BATCH_DUPLICATE_BARCODE]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+        seen_barcodes.add(barcode)
+
+        if shelf_code in seen_shelves:
+            result_entry["error_code"] = ErrorCode.BATCH_DUPLICATE_SHELF
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.BATCH_DUPLICATE_SHELF]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+        seen_shelves.add(shelf_code)
+
+        reservation = db.query(Reservation).filter(Reservation.barcode == barcode).first()
+        if not reservation:
+            result_entry["error_code"] = ErrorCode.BARCODE_NOT_FOUND
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.BARCODE_NOT_FOUND]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+
+        if reservation.status in ("PICKED_UP", "CANCELLED", "EXPIRED"):
+            result_entry["error_code"] = ErrorCode.RESERVATION_ALREADY_FINAL
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.RESERVATION_ALREADY_FINAL]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+
+        if reservation.status not in ("IMPORTED", "SHELF_ASSIGNED", "READY_FOR_PICKUP"):
+            result_entry["error_code"] = ErrorCode.INVALID_STATUS_TRANSITION
+            result_entry["error_message"] = f"当前状态 {reservation.status} 不允许调整架位"
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+
+        shelf = db.query(ShelfRule).filter(ShelfRule.shelf_code == shelf_code, ShelfRule.is_active == True).first()
+        if not shelf:
+            result_entry["error_code"] = ErrorCode.SHELF_NOT_FOUND
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.SHELF_NOT_FOUND]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+
+        occupied = db.query(Reservation).filter(
+            Reservation.shelf_code == shelf_code,
+            Reservation.status.in_(["SHELF_ASSIGNED", "READY_FOR_PICKUP"])
+        ).first()
+        if occupied and occupied.id != reservation.id:
+            result_entry["error_code"] = ErrorCode.SHELF_ALREADY_OCCUPIED
+            result_entry["error_message"] = ERROR_MESSAGES[ErrorCode.SHELF_ALREADY_OCCUPIED]
+            item_results.append(result_entry)
+            has_failure = True
+            continue
+
+        result_entry["_reservation"] = reservation
+        result_entry["_from_shelf"] = reservation.shelf_code
+        result_entry["success"] = True
+        item_results.append(result_entry)
+
+    if has_failure:
+        write_audit(
+            db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
+            "batch", None,
+            {"items": [it.model_dump() for it in items],
+             "results": [{"index": r["index"], "barcode": r["barcode"],
+                          "shelf_code": r["shelf_code"], "success": r["success"],
+                          "error_code": r["error_code"], "error_message": r["error_message"]}
+                         for r in item_results]},
+            "FAIL", ErrorCode.BATCH_ROLLBACK, ERROR_MESSAGES[ErrorCode.BATCH_ROLLBACK]
+        )
+        db.commit()
+        for r in item_results:
+            r.pop("_reservation", None)
+            r.pop("_from_shelf", None)
+        return {
+            "code": ErrorCode.BATCH_ROLLBACK,
+            "message": ERROR_MESSAGES[ErrorCode.BATCH_ROLLBACK],
+            "data": {
+                "success_count": 0,
+                "failed_count": sum(1 for r in item_results if not r["success"]),
+                "results": item_results,
+            },
+        }
+
+    try:
+        batch_no = generate_batch_no()
+        revoke_minutes = get_revoke_minutes(db)
+        revoke_deadline = datetime.utcnow() + timedelta(minutes=revoke_minutes)
+
+        batch = ShelfMoveBatch(
+            batch_no=batch_no,
+            operator_account=operator_account,
+            operator_role=operator_role,
+            status=BATCH_STATUS_COMPLETED,
+            revoke_deadline=revoke_deadline,
+            remark=remark,
+        )
+        db.add(batch)
+        db.flush()
+
+        for r in item_results:
+            reservation = r["_reservation"]
+            old_shelf = r["_from_shelf"]
+            new_shelf = r["shelf_code"]
+            old_status = reservation.status
+
+            reservation.shelf_code = new_shelf
+            reservation.status = "SHELF_ASSIGNED" if reservation.status == "IMPORTED" else reservation.status
+
+            add_status_history(
+                db, reservation.id, old_status, reservation.status,
+                operator_account, operator_role,
+                shelf_code_snapshot=new_shelf,
+                remark=f"批量调架: {old_shelf or '无'} → {new_shelf} (批次 {batch_no})"
+            )
+
+            move_item = ShelfMoveItem(
+                batch_id=batch.id,
+                barcode=r["barcode"],
+                from_shelf_code=old_shelf,
+                to_shelf_code=new_shelf,
+                reservation_id=reservation.id,
+            )
+            db.add(move_item)
+
+        write_audit(
+            db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
+            "batch", batch_no,
+            {"items": [it.model_dump() for it in items],
+             "batch_no": batch_no,
+             "remark": remark,
+             "revoke_deadline": revoke_deadline.isoformat()},
+            "SUCCESS"
+        )
+
+        db.commit()
+        db.refresh(batch)
+
+    except Exception as exc:
+        db.rollback()
+        write_audit(
+            db, "BATCH_MOVE_SHELVES", operator_account, operator_role,
+            "batch", None,
+            {"items": [it.model_dump() for it in items]},
+            "FAIL", ErrorCode.INTERNAL_ERROR, str(exc)
+        )
+        db.commit()
+        for r in item_results:
+            r["success"] = False
+            r["error_code"] = ErrorCode.INTERNAL_ERROR
+            r["error_message"] = str(exc)
+            r.pop("_reservation", None)
+            r.pop("_from_shelf", None)
+        return {
+            "code": ErrorCode.INTERNAL_ERROR,
+            "message": str(exc),
+            "data": {
+                "success_count": 0,
+                "failed_count": len(item_results),
+                "results": item_results,
+            },
+        }
+
+    for r in item_results:
+        r.pop("_reservation", None)
+        r.pop("_from_shelf", None)
+
+    return {
+        "code": ErrorCode.SUCCESS,
+        "message": ERROR_MESSAGES[ErrorCode.SUCCESS],
+        "data": {
+            "batch_no": batch_no,
+            "batch_id": batch.id,
+            "revoke_deadline": revoke_deadline.isoformat(),
+            "success_count": len(item_results),
+            "failed_count": 0,
+            "results": item_results,
+        },
+    }
+
+
+def is_batch_revocable(db: Session, batch: ShelfMoveBatch) -> Tuple[bool, Optional[str]]:
+    if batch.status == BATCH_STATUS_REVOKED:
+        return False, ErrorCode.BATCH_ALREADY_REVOKED
+    revoke_minutes = get_revoke_minutes(db)
+    if revoke_minutes <= 0:
+        return False, ErrorCode.REVOKE_WINDOW_EXPIRED
+    if datetime.utcnow() > batch.revoke_deadline:
+        return False, ErrorCode.REVOKE_WINDOW_EXPIRED
+    for item in batch.items:
+        reservation = db.query(Reservation).filter(Reservation.id == item.reservation_id).first()
+        if not reservation:
+            return False, ErrorCode.ITEM_STATE_CHANGED
+        if reservation.shelf_code != item.to_shelf_code:
+            return False, ErrorCode.ITEM_STATE_CHANGED
+        if reservation.status in ("PICKED_UP", "CANCELLED", "EXPIRED"):
+            return False, ErrorCode.ITEM_STATE_CHANGED
+    return True, None
+
+
+def revoke_shelf_move_batch(db: Session, operator_account: str, operator_role: str,
+                            batch_id: int, revoke_reason: Optional[str] = None):
+    ok, err = require_librarian(operator_role)
+    if not ok:
+        write_audit(
+            db, "REVOKE_SHELF_MOVE", operator_account, operator_role,
+            "batch", str(batch_id),
+            {"batch_id": batch_id, "revoke_reason": revoke_reason},
+            "FAIL", err, ERROR_MESSAGES.get(err, "未知错误")
+        )
+        db.commit()
+        return {"code": err, "message": ERROR_MESSAGES.get(err, "未知错误"), "data": None}
+
+    batch = db.query(ShelfMoveBatch).filter(ShelfMoveBatch.id == batch_id).first()
+    if not batch:
+        write_audit(
+            db, "REVOKE_SHELF_MOVE", operator_account, operator_role,
+            "batch", str(batch_id),
+            {"batch_id": batch_id, "revoke_reason": revoke_reason},
+            "FAIL", ErrorCode.BATCH_NOT_FOUND, ERROR_MESSAGES[ErrorCode.BATCH_NOT_FOUND]
+        )
+        db.commit()
+        return {"code": ErrorCode.BATCH_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.BATCH_NOT_FOUND], "data": None}
+
+    revocable, reason_code = is_batch_revocable(db, batch)
+    if not revocable:
+        write_audit(
+            db, "REVOKE_SHELF_MOVE", operator_account, operator_role,
+            "batch", batch.batch_no,
+            {"batch_id": batch_id, "batch_no": batch.batch_no, "revoke_reason": revoke_reason},
+            "FAIL", reason_code, ERROR_MESSAGES.get(reason_code, "未知错误")
+        )
+        db.commit()
+        return {
+            "code": reason_code,
+            "message": ERROR_MESSAGES.get(reason_code, "未知错误"),
+            "data": None,
+        }
+
+    try:
+        for item in batch.items:
+            reservation = db.query(Reservation).filter(Reservation.id == item.reservation_id).first()
+            old_shelf = reservation.shelf_code
+            old_status = reservation.status
+            reservation.shelf_code = item.from_shelf_code
+
+            target_status = old_status
+            if item.from_shelf_code is None and old_status == "SHELF_ASSIGNED":
+                target_status = "IMPORTED"
+
+            if target_status != old_status:
+                reservation.status = target_status
+
+            add_status_history(
+                db, reservation.id, old_status, target_status,
+                operator_account, operator_role,
+                shelf_code_snapshot=item.from_shelf_code,
+                remark=f"撤销批量调架: {old_shelf} → {item.from_shelf_code or '无'} (批次 {batch.batch_no})"
+                       + (f" 原因: {revoke_reason}" if revoke_reason else "")
+            )
+
+        batch.status = BATCH_STATUS_REVOKED
+
+        write_audit(
+            db, "REVOKE_SHELF_MOVE", operator_account, operator_role,
+            "batch", batch.batch_no,
+            {"batch_id": batch_id, "batch_no": batch.batch_no,
+             "revoke_reason": revoke_reason,
+             "items": [{"barcode": it.barcode, "from_shelf": it.from_shelf_code, "to_shelf": it.to_shelf_code}
+                       for it in batch.items]},
+            "SUCCESS"
+        )
+        db.commit()
+        db.refresh(batch)
+
+    except Exception as exc:
+        db.rollback()
+        write_audit(
+            db, "REVOKE_SHELF_MOVE", operator_account, operator_role,
+            "batch", str(batch_id),
+            {"batch_id": batch_id, "revoke_reason": revoke_reason},
+            "FAIL", ErrorCode.INTERNAL_ERROR, str(exc)
+        )
+        db.commit()
+        return {"code": ErrorCode.INTERNAL_ERROR, "message": str(exc), "data": None}
+
+    return {
+        "code": ErrorCode.SUCCESS,
+        "message": ERROR_MESSAGES[ErrorCode.SUCCESS],
+        "data": {
+            "batch_id": batch.id,
+            "batch_no": batch.batch_no,
+            "status": batch.status,
+            "revoked_count": len(batch.items),
+        },
+    }
+
+
+def get_shelf_move_batch(db: Session, batch_id: int):
+    batch = db.query(ShelfMoveBatch).filter(ShelfMoveBatch.id == batch_id).first()
+    if not batch:
+        return {"code": ErrorCode.BATCH_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.BATCH_NOT_FOUND], "data": None}
+    revocable, _ = is_batch_revocable(db, batch)
+    return {
+        "code": ErrorCode.SUCCESS,
+        "message": ERROR_MESSAGES[ErrorCode.SUCCESS],
+        "data": {"batch": batch, "revocable": revocable},
+    }
+
+
+def query_shelf_move_batches(db: Session, params):
+    q = db.query(ShelfMoveBatch)
+    if params.operator_account:
+        q = q.filter(ShelfMoveBatch.operator_account == params.operator_account)
+    if params.status:
+        q = q.filter(ShelfMoveBatch.status == params.status)
+    if params.created_from:
+        q = q.filter(ShelfMoveBatch.created_at >= params.created_from)
+    if params.created_to:
+        q = q.filter(ShelfMoveBatch.created_at <= params.created_to)
+    return q.order_by(ShelfMoveBatch.created_at.desc()).all()

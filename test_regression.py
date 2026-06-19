@@ -447,11 +447,380 @@ print("\n--- F. 版本号一致性 ---")
 
 code_root, resp_root = req("GET", "/")
 code_health, resp_health = req("GET", "/health")
-check("F1 根路径版本=1.1.0", resp_root.get("version") == "1.1.0",
+check("F1 根路径版本=1.2.0", resp_root.get("version") == "1.2.0",
       f"version={resp_root.get('version')}")
-check("F2 健康检查版本=1.1.0", resp_health.get("version") == "1.1.0",
+check("F2 健康检查版本=1.2.0", resp_health.get("version") == "1.2.0",
       f"version={resp_health.get('version')}")
 check("F3 两处版本一致", resp_root.get("version") == resp_health.get("version"))
+
+# ----------------------------------------------------------
+# G. 批量调架与撤销回退
+print("\n--- G. 批量调架与撤销回退 ---")
+
+# G1: 先导入 5 本书作为测试数据
+code, resp = req("POST", "/api/reservations/import", {
+    "operator_account": "reader01",
+    "operator_role": "reader",
+    "reservations": [
+        {"barcode": "BK-BATCH-01", "book_title": "批量调架书1", "isbn": "B001", "reader_account": "reader01", "reader_name": "读者一"},
+        {"barcode": "BK-BATCH-02", "book_title": "批量调架书2", "isbn": "B002", "reader_account": "reader01", "reader_name": "读者一"},
+        {"barcode": "BK-BATCH-03", "book_title": "批量调架书3", "isbn": "B003", "reader_account": "reader02", "reader_name": "读者二"},
+        {"barcode": "BK-BATCH-04", "book_title": "批量调架书4", "isbn": "B004", "reader_account": "reader02", "reader_name": "读者二"},
+        {"barcode": "BK-BATCH-05", "book_title": "批量调架书5", "isbn": "B005", "reader_account": "reader02", "reader_name": "读者二"},
+    ]
+})
+check("G1 导入 5 本测试书成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}, failed={resp['data'].get('failed_count', 'N/A')}")
+
+# G2: 读者越权批量调架，应被拒
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "reader01",
+    "operator_role": "reader",
+    "items": [
+        {"barcode": "BK-BATCH-01", "shelf_code": "A-01-01"},
+        {"barcode": "BK-BATCH-02", "shelf_code": "A-01-02"},
+    ]
+})
+check("G2 读者批量调架被拒", resp["code"] == "PERMISSION_DENIED",
+      f"code={resp['code']}")
+
+# G3: 匿名批量调架，应被拒
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "anon01",
+    "operator_role": "anonymous",
+    "items": [
+        {"barcode": "BK-BATCH-01", "shelf_code": "A-01-01"},
+    ]
+})
+check("G3 匿名批量调架被拒", resp["code"] == "PERMISSION_ANONYMOUS_FORBIDDEN",
+      f"code={resp['code']}")
+
+# G4: 批量调架 - 整批成功（3 本书）
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-BATCH-01", "shelf_code": "B-01-01"},
+        {"barcode": "BK-BATCH-02", "shelf_code": "B-01-02"},
+        {"barcode": "BK-BATCH-03", "shelf_code": "A-02-01"},
+    ],
+    "remark": "G4 测试整批成功"
+})
+check("G4 批量调架整批成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+if resp["code"] == "SUCCESS":
+    batch_id_g4 = resp["data"]["batch_id"]
+    batch_no_g4 = resp["data"]["batch_no"]
+    check("G4 success_count=3", resp["data"]["success_count"] == 3,
+          f"actual={resp['data']['success_count']}")
+    check("G4 failed_count=0", resp["data"]["failed_count"] == 0,
+          f"actual={resp['data']['failed_count']}")
+    for r in resp["data"]["results"]:
+        check(f"  G4 条 {r['barcode']} success=True", r["success"] is True)
+else:
+    batch_id_g4 = None
+    batch_no_g4 = None
+
+# G5: 验证批量调架后架位已正确更新
+if batch_id_g4 is not None:
+    for barcode, expected_shelf in [("BK-BATCH-01", "B-01-01"),
+                                     ("BK-BATCH-02", "B-01-02"),
+                                     ("BK-BATCH-03", "A-02-01")]:
+        code, resp = req("GET", f"/api/reservations/{barcode}/history")
+        r = resp["data"]["reservation"]
+        check(f"G5 {barcode} 架位={expected_shelf}", r["shelf_code"] == expected_shelf,
+              f"actual={r['shelf_code']}")
+        check(f"G5 {barcode} 状态=SHELF_ASSIGNED", r["status"] == "SHELF_ASSIGNED",
+              f"actual={r['status']}")
+        last_h = resp["data"]["histories"][-1]
+        check(f"G5 {barcode} 历史含批量调架备注", "批量调架" in (last_h.get("remark") or ""),
+              f"remark={last_h.get('remark')}")
+
+# G6: 批量调架 - 含冲突触发整批回滚（第 3 条条码不存在，第 4 条重复架位）
+# 先记录 BK-BATCH-01/02/03 当前架位，验证回滚后不变
+code_before, resp_before_01 = req("GET", "/api/reservations/BK-BATCH-01/history")
+code_before, resp_before_02 = req("GET", "/api/reservations/BK-BATCH-02/history")
+code_before, resp_before_03 = req("GET", "/api/reservations/BK-BATCH-03/history")
+before_shelf_01 = resp_before_01["data"]["reservation"]["shelf_code"]
+before_shelf_02 = resp_before_02["data"]["reservation"]["shelf_code"]
+before_shelf_03 = resp_before_03["data"]["reservation"]["shelf_code"]
+before_count_01 = len(resp_before_01["data"]["histories"])
+before_count_02 = len(resp_before_02["data"]["histories"])
+before_count_03 = len(resp_before_03["data"]["histories"])
+
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-BATCH-01", "shelf_code": "B-01-01"},
+        {"barcode": "BK-BATCH-02", "shelf_code": "B-01-02"},
+        {"barcode": "BK-NOT-EXIST", "shelf_code": "A-02-01"},
+        {"barcode": "BK-BATCH-03", "shelf_code": "B-01-02"},
+    ]
+})
+check("G6 冲突触发整批回滚", resp["code"] == "BATCH_ROLLBACK",
+      f"code={resp['code']}")
+if resp["code"] == "BATCH_ROLLBACK":
+    check("G6 success_count=0", resp["data"]["success_count"] == 0,
+          f"actual={resp['data']['success_count']}")
+    check("G6 failed_count=2", resp["data"]["failed_count"] >= 2,
+          f"actual={resp['data']['failed_count']}")
+    error_codes = [r["error_code"] for r in resp["data"]["results"] if r["error_code"]]
+    check("G6 含 BARCODE_NOT_FOUND", "BARCODE_NOT_FOUND" in error_codes,
+          f"error_codes={error_codes}")
+    check("G6 含 BATCH_DUPLICATE_SHELF", "BATCH_DUPLICATE_SHELF" in error_codes,
+          f"error_codes={error_codes}")
+
+# G7: 验证回滚后 BK-BATCH-01/02/03 的架位和历史都没变
+code, resp_01 = req("GET", "/api/reservations/BK-BATCH-01/history")
+code, resp_02 = req("GET", "/api/reservations/BK-BATCH-02/history")
+code, resp_03 = req("GET", "/api/reservations/BK-BATCH-03/history")
+check("G7 回滚后 BK-BATCH-01 架位不变",
+      resp_01["data"]["reservation"]["shelf_code"] == before_shelf_01,
+      f"before={before_shelf_01}, after={resp_01['data']['reservation']['shelf_code']}")
+check("G7 回滚后 BK-BATCH-02 架位不变",
+      resp_02["data"]["reservation"]["shelf_code"] == before_shelf_02,
+      f"before={before_shelf_02}, after={resp_02['data']['reservation']['shelf_code']}")
+check("G7 回滚后 BK-BATCH-03 架位不变",
+      resp_03["data"]["reservation"]["shelf_code"] == before_shelf_03,
+      f"before={before_shelf_03}, after={resp_03['data']['reservation']['shelf_code']}")
+check("G7 回滚后 BK-BATCH-01 历史未新增",
+      len(resp_01["data"]["histories"]) == before_count_01,
+      f"before={before_count_01}, after={len(resp_01['data']['histories'])}")
+check("G7 回滚后 BK-BATCH-02 历史未新增",
+      len(resp_02["data"]["histories"]) == before_count_02,
+      f"before={before_count_02}, after={len(resp_02['data']['histories'])}")
+
+# G8: 测试终态预约无法参与批量调架
+# 先让 BK-BATCH-04 被取消变成终态
+code, resp = req("POST", "/api/reservations/assign-shelf", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "barcode": "BK-BATCH-04",
+    "shelf_code": "B-01-01"
+})
+code, resp = req("POST", "/api/reservations/cancel", {
+    "operator_account": "reader02",
+    "operator_role": "reader",
+    "barcode": "BK-BATCH-04",
+    "cancel_reason": "读者取消，测试终态"
+})
+check("G8 准备 BK-BATCH-04 终态成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-BATCH-05", "shelf_code": "B-01-02"},
+        {"barcode": "BK-BATCH-04", "shelf_code": "B-01-01"},
+    ]
+})
+check("G8 终态预约触发回滚", resp["code"] == "BATCH_ROLLBACK",
+      f"code={resp['code']}")
+if resp["code"] == "BATCH_ROLLBACK":
+    final_errs = [r["error_code"] for r in resp["data"]["results"]]
+    check("G8 含 RESERVATION_ALREADY_FINAL", "RESERVATION_ALREADY_FINAL" in final_errs,
+          f"error_codes={final_errs}")
+
+# G9: 正常撤销 G4 的批量调架（在撤销窗口内）
+if batch_id_g4 is not None:
+    code, resp = req("POST", f"/api/shelf-moves/{batch_id_g4}/revoke", {
+        "operator_account": "librarian01",
+        "operator_role": "librarian",
+        "revoke_reason": "G9 测试撤销"
+    })
+    check("G9 撤销 G4 批次成功", resp["code"] == "SUCCESS",
+          f"code={resp['code']}, msg={resp.get('message','')}")
+    if resp["code"] == "SUCCESS":
+        check("G9 撤销数量=3", resp["data"]["revoked_count"] == 3,
+              f"actual={resp['data']['revoked_count']}")
+        check("G9 批次状态=REVOKED", resp["data"]["status"] == "REVOKED",
+              f"actual={resp['data']['status']}")
+
+# G10: 撤销后验证架位回到原来的 None（导入状态无架位）
+for barcode in ["BK-BATCH-01", "BK-BATCH-02", "BK-BATCH-03"]:
+    code, resp = req("GET", f"/api/reservations/{barcode}/history")
+    r = resp["data"]["reservation"]
+    check(f"G10 {barcode} 撤销后架位为空", r["shelf_code"] is None,
+          f"actual={r['shelf_code']}")
+    check(f"G10 {barcode} 撤销后状态回到 IMPORTED", r["status"] == "IMPORTED",
+          f"actual={r['status']}")
+    last_h = resp["data"]["histories"][-1]
+    check(f"G10 {barcode} 历史含撤销备注", "撤销批量调架" in (last_h.get("remark") or ""),
+          f"remark={last_h.get('remark')}")
+
+# G11: 重复撤销应该被拒
+if batch_id_g4 is not None:
+    code, resp = req("POST", f"/api/shelf-moves/{batch_id_g4}/revoke", {
+        "operator_account": "librarian01",
+        "operator_role": "librarian",
+        "revoke_reason": "G11 重复撤销"
+    })
+    check("G11 重复撤销被拒", resp["code"] == "BATCH_ALREADY_REVOKED",
+          f"code={resp['code']}")
+
+# G12: 读者/匿名 撤销被拒
+if batch_id_g4 is not None:
+    code, resp = req("POST", f"/api/shelf-moves/{batch_id_g4}/revoke", {
+        "operator_account": "reader01",
+        "operator_role": "reader",
+    })
+    check("G12 读者撤销被拒", resp["code"] == "PERMISSION_DENIED",
+          f"code={resp['code']}")
+
+# G13: 撤销窗口过期测试 - 直接改 DB 把 revoke_deadline 改到过去
+# 先重新做一批成功的调架
+code, resp = req("POST", "/api/shelf-moves/batch", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "items": [
+        {"barcode": "BK-BATCH-01", "shelf_code": "A-01-01"},
+        {"barcode": "BK-BATCH-05", "shelf_code": "A-02-01"},
+    ],
+    "remark": "G13 测试撤销窗口过期"
+})
+check("G13 准备一批成功的调架", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+batch_id_g13 = resp["data"]["batch_id"] if resp["code"] == "SUCCESS" else None
+
+if batch_id_g13 is not None:
+    conn = sqlite3.connect(DB_PATH)
+    past = (utc_now() - dt.timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    conn.execute("UPDATE shelf_move_batches SET revoke_deadline = ? WHERE id = ?",
+                 (past, batch_id_g13))
+    conn.commit()
+    conn.close()
+    print(f"  已将批次 {batch_id_g13} 的 revoke_deadline 设为过去: {past}")
+
+    code, resp = req("POST", f"/api/shelf-moves/{batch_id_g13}/revoke", {
+        "operator_account": "librarian01",
+        "operator_role": "librarian",
+    })
+    check("G13 超出撤销窗口被拒", resp["code"] == "REVOKE_WINDOW_EXPIRED",
+          f"code={resp['code']}")
+
+# G14: 批次列表查询与详情查询
+code, resp = req("GET", "/api/shelf-moves")
+check("G14 批次列表查询成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+if resp["code"] == "SUCCESS" and len(resp["data"]["batches"]) > 0:
+    first = resp["data"]["batches"][0]
+    check("G14 批次含 batch_no", "batch_no" in first and first["batch_no"],
+          f"keys={list(first.keys())}")
+    check("G14 批次含 revocable 字段", "revocable" in first,
+          f"keys={list(first.keys())}")
+    check("G14 批次含 items 明细", "items" in first and len(first["items"]) > 0,
+          f"items_count={len(first.get('items', []))}")
+
+    bid = first["id"]
+    code, resp_detail = req("GET", f"/api/shelf-moves/{bid}")
+    check("G14 批次详情查询成功", resp_detail["code"] == "SUCCESS",
+          f"code={resp_detail['code']}")
+
+# G15: JSON 导出与 CSV 导出
+code_api, resp_api = req("GET", "/api/shelf-moves")
+with urllib.request.urlopen(f"{BASE}/api/shelf-moves/export/json") as raw:
+    export_json = json.loads(raw.read().decode("utf-8"))
+check("G15 JSON 导出条数与 API 一致",
+      len(resp_api["data"]["batches"]) == len(export_json),
+      f"api={len(resp_api['data']['batches'])}, export={len(export_json)}")
+
+with urllib.request.urlopen(f"{BASE}/api/shelf-moves/export/csv") as raw:
+    csv_raw = raw.read().decode("utf-8-sig")
+check("G15 CSV 导出含表头", "batch_no" in csv_raw and "barcode" in csv_raw,
+      f"csv start={csv_raw[:100]}")
+
+# G16: 审计日志中有 BATCH_MOVE_SHELVES 和 REVOKE_SHELF_MOVE
+code, resp = req("GET", "/api/audit?action=BATCH_MOVE_SHELVES")
+check("G16 审计有 BATCH_MOVE_SHELVES 记录", len(resp["data"]["audit_logs"]) >= 1,
+      f"count={len(resp['data']['audit_logs'])}")
+code, resp = req("GET", "/api/audit?action=REVOKE_SHELF_MOVE")
+check("G16 审计有 REVOKE_SHELF_MOVE 记录", len(resp["data"]["audit_logs"]) >= 1,
+      f"count={len(resp['data']['audit_logs'])}")
+
+# G17: 审计 JSON/CSV 导出中包含批量操作
+with urllib.request.urlopen(f"{BASE}/api/audit/export/json") as raw:
+    audit_json = json.loads(raw.read().decode("utf-8"))
+batch_actions = [a for a in audit_json if a["action"] in ("BATCH_MOVE_SHELVES", "REVOKE_SHELF_MOVE")]
+check("G17 审计 JSON 导出含批量操作", len(batch_actions) >= 2,
+      f"count={len(batch_actions)}")
+
+# ----------------------------------------------------------
+# H. 服务重启后批量调架数据一致性
+print("\n--- H. 服务重启后批量调架数据一致性 ---")
+
+# H1: 先记录重启前批次数量与明细
+code, resp_before_batches = req("GET", "/api/shelf-moves")
+batches_before = resp_before_batches["data"]["batches"]
+batch_count_before = len(batches_before)
+
+# 记录 G13 批次中 BK-BATCH-01 和 BK-BATCH-02 的架位
+code, resp_r1 = req("GET", "/api/reservations/BK-BATCH-01/history")
+code, resp_r2 = req("GET", "/api/reservations/BK-BATCH-02/history")
+shelf_1_before = resp_r1["data"]["reservation"]["shelf_code"]
+shelf_2_before = resp_r2["data"]["reservation"]["shelf_code"]
+status_1_before = resp_r1["data"]["reservation"]["status"]
+status_2_before = resp_r2["data"]["reservation"]["status"]
+hist_1_count_before = len(resp_r1["data"]["histories"])
+hist_2_count_before = len(resp_r2["data"]["histories"])
+
+# 审计条数
+code, resp_audit_before = req("GET", "/api/audit")
+audit_count_before = len(resp_audit_before["data"]["audit_logs"])
+
+# H2: 停止并重启服务
+print("  停止服务...")
+stop_service(proc)
+time.sleep(1)
+print("  重启服务...")
+proc = start_service()
+print(f"  服务已重启 (PID {proc.pid})")
+
+# H3: 重启后查询批次数量一致
+code, resp_after_batches = req("GET", "/api/shelf-moves")
+batch_count_after = len(resp_after_batches["data"]["batches"])
+check("H3 重启后批次数量一致", batch_count_before == batch_count_after,
+      f"before={batch_count_before}, after={batch_count_after}")
+
+# H4: 重启后 BK-BATCH-01/02 架位、状态、历史一致
+code, resp_r1_after = req("GET", "/api/reservations/BK-BATCH-01/history")
+code, resp_r2_after = req("GET", "/api/reservations/BK-BATCH-02/history")
+check("H4 BK-BATCH-01 架位一致",
+      resp_r1_after["data"]["reservation"]["shelf_code"] == shelf_1_before,
+      f"before={shelf_1_before}, after={resp_r1_after['data']['reservation']['shelf_code']}")
+check("H4 BK-BATCH-02 架位一致",
+      resp_r2_after["data"]["reservation"]["shelf_code"] == shelf_2_before,
+      f"before={shelf_2_before}, after={resp_r2_after['data']['reservation']['shelf_code']}")
+check("H4 BK-BATCH-01 状态一致",
+      resp_r1_after["data"]["reservation"]["status"] == status_1_before,
+      f"before={status_1_before}, after={resp_r1_after['data']['reservation']['status']}")
+check("H4 BK-BATCH-01 历史条数一致",
+      len(resp_r1_after["data"]["histories"]) == hist_1_count_before,
+      f"before={hist_1_count_before}, after={len(resp_r1_after['data']['histories'])}")
+
+# H5: 重启后可撤销判断仍然正确（G13 批次应该不可撤销，G4 批次 REVOKED 也不可撤销）
+if batch_id_g13 is not None:
+    code, resp = req("GET", f"/api/shelf-moves/{batch_id_g13}")
+    check("H5 G13 批次重启后仍不可撤销", resp["data"]["revocable"] is False,
+          f"revocable={resp['data']['revocable']}")
+if batch_id_g4 is not None:
+    code, resp = req("GET", f"/api/shelf-moves/{batch_id_g4}")
+    check("H5 G4 批次重启后仍为 REVOKED 且不可撤销",
+          resp["data"]["batch"]["status"] == "REVOKED" and resp["data"]["revocable"] is False,
+          f"status={resp['data']['batch']['status']}, revocable={resp['data']['revocable']}")
+
+# H6: 重启后审计条数一致
+code, resp_audit_after = req("GET", "/api/audit")
+audit_count_after = len(resp_audit_after["data"]["audit_logs"])
+check("H6 重启后审计条数一致", audit_count_before == audit_count_after - 1,  # 减 1 因为启动扫描又记了一条
+      f"before={audit_count_before}, after={audit_count_after}")
+
+# H7: 重启后导出结果与重启前一致（条数）
+with urllib.request.urlopen(f"{BASE}/api/shelf-moves/export/json") as raw:
+    export_json_after = json.loads(raw.read().decode("utf-8"))
+check("H7 重启后 JSON 导出条数一致", len(export_json) == len(export_json_after),
+      f"before={len(export_json)}, after={len(export_json_after)}")
 
 # ----------------------------------------------------------
 # 清理

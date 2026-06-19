@@ -23,7 +23,10 @@ CANCEL_BY_ANONYMOUS = "anonymous"
 
 EXPIRE_REASON_TIMEOUT = "EXPIRE_TIMEOUT"
 EXPIRE_REASON_STARTUP_SCAN = "EXPIRE_STARTUP_SCAN"
-EXPIRE_REASON_MANUAL = "EXPIRE_MANUAL"
+EXPIRE_REASON_MANUAL = "EXPIRE_REASON_MANUAL"
+
+BATCH_STATUS_COMPLETED = "COMPLETED"
+BATCH_STATUS_REVOKED = "REVOKED"
 
 
 class SystemConfig(Base):
@@ -118,3 +121,33 @@ class AuditLog(Base):
     error_code = Column(String(50), nullable=True)
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ShelfMoveBatch(Base):
+    __tablename__ = "shelf_move_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_no = Column(String(50), unique=True, nullable=False, index=True)
+    operator_account = Column(String(100), nullable=False)
+    operator_role = Column(String(30), nullable=False)
+    status = Column(String(30), nullable=False, default=BATCH_STATUS_COMPLETED)
+    revoke_deadline = Column(DateTime, nullable=False)
+    remark = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    items = relationship("ShelfMoveItem", back_populates="batch", cascade="all, delete-orphan")
+
+
+class ShelfMoveItem(Base):
+    __tablename__ = "shelf_move_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(Integer, ForeignKey("shelf_move_batches.id"), nullable=False, index=True)
+    barcode = Column(String(100), nullable=False, index=True)
+    from_shelf_code = Column(String(50), nullable=True)
+    to_shelf_code = Column(String(50), nullable=False)
+    reservation_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    batch = relationship("ShelfMoveBatch", back_populates="items")
