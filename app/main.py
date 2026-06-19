@@ -1,22 +1,22 @@
 from fastapi import FastAPI, Depends, HTTPException, Response, Query
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from datetime import datetime
 import csv
 import io
 import json
+import sys
 
 from app.database import engine, Base, get_db, DB_PATH
 from app import models, schemas, services
 
-Base.metadata.create_all(bind=engine)
+APP_VERSION = "1.1.0"
+APP_NAME = "图书预约架位管理 API"
+APP_DESCRIPTION = "本地图书预约架位 JSON API - 架位规则、取书窗口、预约清单、状态历史、审计日志、过期自动回收"
 
-app = FastAPI(
-    title="图书预约架位管理 API",
-    description="本地图书预约架位 JSON API - 架位规则、取书窗口、预约清单、状态历史、审计日志、过期自动回收",
-    version="1.1.0",
-)
+Base.metadata.create_all(bind=engine)
 
 
 def seed_initial_data(db: Session):
@@ -50,23 +50,37 @@ def run_startup_tasks():
             db, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
         )
         if scan_result["expired_count"] > 0:
-            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，回收 {scan_result['expired_count']} 条已过期预约")
+            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，回收 {scan_result['expired_count']} 条已过期预约", flush=True)
             for d in scan_result["details"]:
-                print(f"  - 条码 {d['barcode']} ({d['book_title']}) 架位 {d['shelf_code']} 读者 {d['reader_account']} 已自动过期")
+                print(f"  - 条码 {d['barcode']} ({d['book_title']}) 架位 {d['shelf_code']} 读者 {d['reader_account']} 已自动过期", flush=True)
         else:
-            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，未发现需回收的过期预约")
+            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，未发现需回收的过期预约", flush=True)
+        return scan_result
 
 
-run_startup_tasks()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scan_result = run_startup_tasks()
+    app.state.startup_scan_result = scan_result
+    yield
+
+
+app = FastAPI(
+    title=APP_NAME,
+    description=APP_DESCRIPTION,
+    version=APP_VERSION,
+    lifespan=lifespan,
+)
 
 
 @app.get("/")
 def root():
     return {
-        "service": "图书预约架位管理 API",
-        "version": "1.1.0",
+        "service": APP_NAME,
+        "version": APP_VERSION,
         "database": DB_PATH,
         "docs": "/docs",
+        "health": "/health",
         "features": [
             "导入预约 + 重复条码检测",
             "架位分配 + 冲突检测",
@@ -76,6 +90,16 @@ def root():
             "状态历史带架位快照，便于馆员查单",
             "CSV/JSON 审计导出、多条件筛选查询"
         ]
+    }
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 

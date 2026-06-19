@@ -9,7 +9,9 @@ import sys
 import os
 import io
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+os.environ["PYTHONIOENCODING"] = "utf-8"
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 BASE = "http://localhost:8000"
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "library.db")
@@ -61,17 +63,30 @@ def assert_in(name, value, container):
 
 ALL_PASS = True
 
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
 try:
     print("=" * 60)
     print("1. 服务根路径 / 版本号")
     print("=" * 60)
     _, root = req("GET", "/")
-    assert_eq("版本号", root["version"], "1.1.0")
+    assert_eq("根路径版本号", root["version"], "1.1.0")
     assert_in("特性列表含扫描过期", "扫描过期", str(root.get("features", [])))
 
     print()
     print("=" * 60)
-    print("2. 预置数据（架位 5 / 窗口 3 / 配置 default_expire_hours=48）")
+    print("2. 健康检查 /health 版本号一致")
+    print("=" * 60)
+    _, hc = req("GET", "/health")
+    assert_eq("健康检查状态", hc["status"], "healthy")
+    assert_eq("健康检查版本号", hc["version"], "1.1.0")
+    assert_eq("健康检查与根路径版本一致", hc["version"], root["version"])
+
+    print()
+    print("=" * 60)
+    print("3. 预置数据（架位 5 / 窗口 3 / 配置 default_expire_hours=48）")
     print("=" * 60)
     _, sr = req("GET", "/api/shelves")
     assert_eq("架位条数", len(sr["data"]["shelves"]), 5)
@@ -85,7 +100,7 @@ try:
 
     print()
     print("=" * 60)
-    print("3. 导入预约（成功 3 条）")
+    print("4. 导入预约（成功 3 条）")
     print("=" * 60)
     _, imp = req("POST", "/api/reservations/import", {
         "operator_account": "reader001",
@@ -101,7 +116,7 @@ try:
 
     print()
     print("=" * 60)
-    print("4. 重复条码导入（失败）")
+    print("5. 重复条码导入（失败）")
     print("=" * 60)
     _, dup = req("POST", "/api/reservations/import", {
         "operator_account": "reader002",
@@ -116,7 +131,7 @@ try:
 
     print()
     print("=" * 60)
-    print("5. BK20260001 分配架位 A-01-01（expire_hours=0 模拟即刻过期）")
+    print("6. BK20260001 分配架位 A-01-01（expire_hours=0 模拟即刻过期）")
     print("=" * 60)
     _, a1 = req("POST", "/api/reservations/assign-shelf", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -129,7 +144,7 @@ try:
 
     print()
     print("=" * 60)
-    print("6. BK20260002 分配架位 B-01-01（走默认 48h）")
+    print("7. BK20260002 分配架位 B-01-01（走默认 48h）")
     print("=" * 60)
     _, a2 = req("POST", "/api/reservations/assign-shelf", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -139,7 +154,7 @@ try:
 
     print()
     print("=" * 60)
-    print("7. BK20260003 分配架位 A-01-02，再尝试 A-01-01（冲突）")
+    print("8. BK20260003 分配架位 A-01-02，再尝试 A-01-01（冲突）")
     print("=" * 60)
     req("POST", "/api/reservations/assign-shelf", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -156,7 +171,7 @@ try:
 
     print()
     print("=" * 60)
-    print("8. BK20260001 标记待取")
+    print("9. BK20260001 标记待取")
     print("=" * 60)
     _, rdy = req("POST", "/api/reservations/mark-ready", {
         "operator_account": "librarian01", "operator_role": "librarian", "barcode": "BK20260001",
@@ -165,7 +180,7 @@ try:
 
     print()
     print("=" * 60)
-    print("9. 【权限】reader002 取消 reader001 的 BK20260002（非所有者被拒）")
+    print("10. 【权限】reader002 取消 reader001 的 BK20260002（非所有者被拒）")
     print("=" * 60)
     code, no = req("POST", "/api/reservations/cancel", {
         "operator_account": "reader002", "operator_role": "reader",
@@ -180,7 +195,7 @@ try:
 
     print()
     print("=" * 60)
-    print("10. 【权限】匿名取消被拒")
+    print("11. 【权限】匿名取消被拒")
     print("=" * 60)
     code, an = req("POST", "/api/reservations/cancel", {
         "operator_account": "stranger", "operator_role": "anonymous",
@@ -191,7 +206,7 @@ try:
 
     print()
     print("=" * 60)
-    print("11. 【权限】读者冒充馆员确认取书被拒")
+    print("12. 【权限】读者冒充馆员确认取书被拒")
     print("=" * 60)
     code, pk = req("POST", "/api/reservations/confirm-pickup", {
         "operator_account": "reader001", "operator_role": "reader",
@@ -204,7 +219,7 @@ try:
 
     print()
     print("=" * 60)
-    print("12. 馆员确认取走 BK20260001")
+    print("13. 馆员确认取走 BK20260001")
     print("=" * 60)
     _, okpk = req("POST", "/api/reservations/confirm-pickup", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -215,7 +230,7 @@ try:
 
     print()
     print("=" * 60)
-    print("13. BK20260001 状态历史：时间/身份/架位快照 齐全")
+    print("14. BK20260001 状态历史：时间/身份/架位快照 齐全")
     print("=" * 60)
     _, full = req("GET", "/api/reservations/BK20260001/history")
     hs = full["data"]["histories"]
@@ -231,7 +246,7 @@ try:
 
     print()
     print("=" * 60)
-    print("14. 读者本人取消 BK20260002")
+    print("15. 读者本人取消 BK20260002")
     print("=" * 60)
     _, cn = req("POST", "/api/reservations/cancel", {
         "operator_account": "reader001", "operator_role": "reader",
@@ -243,14 +258,14 @@ try:
 
     print()
     print("=" * 60)
-    print("15. 【模拟重启过期】把 BK20260003 expire_at 改过去，再调用扫描（等效于服务重启自动扫描）")
+    print("16. 【模拟重启过期】把 BK20260003 expire_at 改过去，再调用扫描（等效于服务重启自动扫描）")
     print("=" * 60)
     import sqlite3
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    past_dt = dt.datetime.utcnow() - dt.timedelta(minutes=2)
+    past_dt = utc_now() - dt.timedelta(minutes=2)
     past = past_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-    now_str = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+    now_str = utc_now().strftime("%Y-%m-%d %H:%M:%S.%f")
     cur.execute(
         "UPDATE reservations SET expire_at = ?, status='READY_FOR_PICKUP' WHERE barcode='BK20260003'",
         (past,)
@@ -285,7 +300,7 @@ try:
 
     print()
     print("=" * 60)
-    print("16. 终态保护：BK20260003 已过期，再分配架位被拒")
+    print("17. 终态保护：BK20260003 已过期，再分配架位被拒")
     print("=" * 60)
     code, fe = req("POST", "/api/reservations/assign-shelf", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -296,7 +311,7 @@ try:
 
     print()
     print("=" * 60)
-    print("17. 预约列表多条件筛选")
+    print("18. 预约列表多条件筛选")
     print("=" * 60)
     _, qc = req("GET", "/api/reservations?status=CANCELLED")
     assert len(qc["data"]["reservations"]) >= 1
@@ -307,7 +322,7 @@ try:
 
     print()
     print("=" * 60)
-    print("18. 审计 JSON 导出（字段完整性）")
+    print("19. 审计 JSON 导出（字段完整性）")
     print("=" * 60)
     with urllib.request.urlopen(BASE + "/api/audit/export/json") as resp:
         aj = json.loads(resp.read().decode("utf-8"))
@@ -322,7 +337,7 @@ try:
 
     print()
     print("=" * 60)
-    print("19. 审计筛选 API（仅失败）错误码齐全")
+    print("20. 审计筛选 API（仅失败）错误码齐全")
     print("=" * 60)
     _, fl = req("GET", "/api/audit?response_status=FAIL")
     fcodes = [l["error_code"] for l in fl["data"]["audit_logs"]]
@@ -333,7 +348,7 @@ try:
 
     print()
     print("=" * 60)
-    print("20. API 审计 vs 导出 JSON 字段对齐")
+    print("21. API 审计 vs 导出 JSON 字段对齐")
     print("=" * 60)
     _, al = req("GET", "/api/audit")
     api_logs = al["data"]["audit_logs"]
@@ -350,7 +365,7 @@ try:
 
     print()
     print("=" * 60)
-    print("21. 审计 CSV 导出（表头正确）")
+    print("22. 审计 CSV 导出（表头正确）")
     print("=" * 60)
     with urllib.request.urlopen(BASE + "/api/audit/export/csv") as resp:
         csv_text = resp.read().decode("utf-8-sig")
@@ -362,7 +377,7 @@ try:
 
     print()
     print("=" * 60)
-    print("22. 修改系统配置 default_expire_hours 为 24 并持久化验证")
+    print("23. 修改系统配置 default_expire_hours 为 24 并持久化验证")
     print("=" * 60)
     _, sc = req("POST", "/api/configs", {
         "operator_account": "librarian01", "operator_role": "librarian",
@@ -377,7 +392,7 @@ try:
 
     print()
     print("\n" + "=" * 60)
-    print("🎉 全部 22 大项断言通过！全链路验证成功")
+    print("🎉 全部 23 大项断言通过！全链路验证成功")
     print("=" * 60)
 
 except AssertionError as ae:
