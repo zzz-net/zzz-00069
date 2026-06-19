@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Response
+from fastapi import FastAPI, Depends, HTTPException, Response, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from typing import List
+from typing import Optional, List
+from datetime import datetime
 import csv
 import io
 import json
@@ -13,8 +14,8 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="图书预约架位管理 API",
-    description="本地图书预约架位 JSON API - 架位规则、取书窗口、预约清单、状态历史、审计日志",
-    version="1.0.0",
+    description="本地图书预约架位 JSON API - 架位规则、取书窗口、预约清单、状态历史、审计日志、过期自动回收",
+    version="1.1.0",
 )
 
 
@@ -39,18 +40,42 @@ def seed_initial_data(db: Session):
         for w in windows:
             services.create_pickup_window(db, **w)
 
+    services.ensure_default_configs(db)
 
-with next(get_db()) as db:
-    seed_initial_data(db)
+
+def run_startup_tasks():
+    with next(get_db()) as db:
+        seed_initial_data(db)
+        scan_result = services.scan_expired_reservations(
+            db, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
+        )
+        if scan_result["expired_count"] > 0:
+            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，回收 {scan_result['expired_count']} 条已过期预约")
+            for d in scan_result["details"]:
+                print(f"  - 条码 {d['barcode']} ({d['book_title']}) 架位 {d['shelf_code']} 读者 {d['reader_account']} 已自动过期")
+        else:
+            print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，未发现需回收的过期预约")
+
+
+run_startup_tasks()
 
 
 @app.get("/")
 def root():
     return {
         "service": "图书预约架位管理 API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "database": DB_PATH,
         "docs": "/docs",
+        "features": [
+            "导入预约 + 重复条码检测",
+            "架位分配 + 冲突检测",
+            "取书时限（数据库系统配置表持久化）",
+            "取消权限边界：读者本人/馆员/匿名三种角色区分",
+            "启动自动扫描过期 + 状态历史补齐 + 审计日志",
+            "状态历史带架位快照，便于馆员查单",
+            "CSV/JSON 审计导出、多条件筛选查询"
+        ]
     }
 
 
@@ -90,6 +115,40 @@ def list_pickup_windows(db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/configs", response_model=schemas.ApiResponse)
+def list_configs(db: Session = Depends(get_db)):
+    configs = services.get_all_configs(db)
+    return {
+        "code": schemas.ErrorCode.SUCCESS,
+        "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
+        "data": {"configs": [schemas.SystemConfigOut.model_validate(c).model_dump() for c in configs]},
+    }
+
+
+@app.post("/api/configs", response_model=schemas.ApiResponse)
+def set_config(data: schemas.SystemConfigSetRequest, db: Session = Depends(get_db)):
+    ok, err = services.require_librarian(data.operator_role)
+    if not ok:
+        return JSONResponse(status_code=400, content={
+            "code": err, "message": schemas.ERROR_MESSAGES.get(err, "未知错误"), "data": None
+        })
+    cfg = services.set_config_value(db, data.config_key, data.config_value, data.description)
+    db.commit()
+    db.refresh(cfg)
+    services.write_audit(
+        db, "SET_CONFIG", data.operator_account, data.operator_role,
+        "config", data.config_key,
+        {"config_key": data.config_key, "config_value": data.config_value, "description": data.description},
+        "SUCCESS"
+    )
+    db.commit()
+    return {
+        "code": schemas.ErrorCode.SUCCESS,
+        "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
+        "data": {"config": schemas.SystemConfigOut.model_validate(cfg).model_dump()},
+    }
+
+
 @app.post("/api/reservations/import", response_model=schemas.ApiResponse)
 def import_reservations(data: schemas.ReservationImportRequest, db: Session = Depends(get_db)):
     result = services.import_reservations(
@@ -105,7 +164,7 @@ def assign_shelf(data: schemas.ReservationAssignShelfRequest, db: Session = Depe
     result = services.assign_shelf(
         db, data.operator_account, data.operator_role,
         data.barcode, data.shelf_code, data.pickup_window_id,
-        data.expire_hours or 48
+        data.expire_hours
     )
     if result["code"] != schemas.ErrorCode.SUCCESS:
         return JSONResponse(status_code=400, content=result)
@@ -160,9 +219,62 @@ def cancel_reservation(data: schemas.ReservationUpdateStatusRequest, db: Session
     return result
 
 
+@app.post("/api/reservations/manual-expire", response_model=schemas.ApiResponse)
+def manual_expire(data: schemas.ReservationUpdateStatusRequest, db: Session = Depends(get_db)):
+    result = services.manually_expire_reservation(
+        db, data.operator_account, data.operator_role, data.barcode
+    )
+    if result["code"] != schemas.ErrorCode.SUCCESS:
+        return JSONResponse(status_code=400, content=result)
+    result["data"] = {"reservation": schemas.ReservationOut.model_validate(result["data"]["reservation"]).model_dump()}
+    return result
+
+
+@app.post("/api/reservations/scan-expired", response_model=schemas.ApiResponse)
+def scan_expired(
+    operator_account: Optional[str] = "admin",
+    operator_role: Optional[str] = "librarian",
+    force: bool = False,
+    db: Session = Depends(get_db)
+):
+    ok, err = services.require_librarian(operator_role)
+    if not ok:
+        return JSONResponse(status_code=400, content={
+            "code": err, "message": schemas.ERROR_MESSAGES.get(err, "未知错误"), "data": None
+        })
+    result = services.scan_expired_reservations(
+        db, expire_reason=models.EXPIRE_REASON_TIMEOUT if not force else models.EXPIRE_REASON_MANUAL,
+        force=force
+    )
+    services.write_audit(
+        db, "SCAN_EXPIRED", operator_account, operator_role,
+        "system", None,
+        {"force": force},
+        "SUCCESS"
+    )
+    db.commit()
+    return {
+        "code": schemas.ErrorCode.SUCCESS,
+        "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
+        "data": result,
+    }
+
+
 @app.get("/api/reservations", response_model=schemas.ApiResponse)
-def list_reservations(db: Session = Depends(get_db)):
-    reservations = services.get_all_reservations(db)
+def list_reservations(
+    status: Optional[str] = None,
+    reader_account: Optional[str] = None,
+    shelf_code: Optional[str] = None,
+    barcode: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.ReservationQueryParams(
+        status=status, reader_account=reader_account, shelf_code=shelf_code,
+        barcode=barcode, created_from=created_from, created_to=created_to,
+    )
+    reservations = services.query_reservations(db, params)
     return {
         "code": schemas.ErrorCode.SUCCESS,
         "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],
@@ -183,8 +295,18 @@ def get_reservation_history(barcode: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/audit/export/json")
-def export_audit_json(db: Session = Depends(get_db)):
-    logs = services.get_all_audit_logs(db)
+def export_audit_json(
+    action: Optional[str] = None,
+    operator_account: Optional[str] = None,
+    operator_role: Optional[str] = None,
+    response_status: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.AuditQueryParams(
+        action=action, operator_account=operator_account,
+        operator_role=operator_role, response_status=response_status,
+    )
+    logs = services.query_audit_logs(db, params)
     data = [schemas.AuditLogOut.model_validate(l).model_dump(mode="json") for l in logs]
     response = Response(
         content=json.dumps(data, ensure_ascii=False, indent=2, default=str),
@@ -195,8 +317,18 @@ def export_audit_json(db: Session = Depends(get_db)):
 
 
 @app.get("/api/audit/export/csv")
-def export_audit_csv(db: Session = Depends(get_db)):
-    logs = services.get_all_audit_logs(db)
+def export_audit_csv(
+    action: Optional[str] = None,
+    operator_account: Optional[str] = None,
+    operator_role: Optional[str] = None,
+    response_status: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.AuditQueryParams(
+        action=action, operator_account=operator_account,
+        operator_role=operator_role, response_status=response_status,
+    )
+    logs = services.query_audit_logs(db, params)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -221,8 +353,21 @@ def export_audit_csv(db: Session = Depends(get_db)):
 
 
 @app.get("/api/audit", response_model=schemas.ApiResponse)
-def list_audit_logs(db: Session = Depends(get_db)):
-    logs = services.get_all_audit_logs(db)
+def list_audit_logs(
+    action: Optional[str] = None,
+    operator_account: Optional[str] = None,
+    operator_role: Optional[str] = None,
+    response_status: Optional[str] = None,
+    created_from: Optional[datetime] = None,
+    created_to: Optional[datetime] = None,
+    db: Session = Depends(get_db)
+):
+    params = schemas.AuditQueryParams(
+        action=action, operator_account=operator_account,
+        operator_role=operator_role, response_status=response_status,
+        created_from=created_from, created_to=created_to,
+    )
+    logs = services.query_audit_logs(db, params)
     return {
         "code": schemas.ErrorCode.SUCCESS,
         "message": schemas.ERROR_MESSAGES[schemas.ErrorCode.SUCCESS],

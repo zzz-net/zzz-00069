@@ -4,15 +4,24 @@ from typing import List, Optional, Tuple
 import json
 
 from app.models import (
-    Reservation, ShelfRule, PickupWindow, StatusHistory, AuditLog,
-    RESERVATION_STATUS, ROLE_READER, ROLE_LIBRARIAN
+    Reservation, ShelfRule, PickupWindow, StatusHistory, AuditLog, SystemConfig,
+    RESERVATION_STATUS, ROLE_READER, ROLE_LIBRARIAN, ROLE_ANONYMOUS,
+    CANCEL_BY_SELF, CANCEL_BY_LIBRARIAN, CANCEL_BY_ANONYMOUS,
+    EXPIRE_REASON_TIMEOUT, EXPIRE_REASON_STARTUP_SCAN, EXPIRE_REASON_MANUAL
 )
 from app.schemas import (
-    ReservationImportItem, ErrorCode, ERROR_MESSAGES
+    ReservationImportItem, ErrorCode, ERROR_MESSAGES,
+    ReservationQueryParams, AuditQueryParams
 )
 
 
-VALID_ROLES = {ROLE_READER, ROLE_LIBRARIAN}
+DEFAULT_EXPIRE_HOURS_KEY = "default_expire_hours"
+DEFAULT_EXPIRE_HOURS = 48
+SYSTEM_OPERATOR_ACCOUNT = "__system__"
+
+
+VALID_ROLES = {ROLE_READER, ROLE_LIBRARIAN, ROLE_ANONYMOUS}
+CANCELABLE_STATUSES = {"IMPORTED", "SHELF_ASSIGNED", "READY_FOR_PICKUP"}
 
 
 def write_audit(db: Session, action: str, operator_account: str, operator_role: str,
@@ -36,6 +45,7 @@ def write_audit(db: Session, action: str, operator_account: str, operator_role: 
 
 def add_status_history(db: Session, reservation_id: int, from_status: Optional[str],
                        to_status: str, operator_account: str, operator_role: str,
+                       shelf_code_snapshot: Optional[str] = None,
                        remark: Optional[str] = None):
     history = StatusHistory(
         reservation_id=reservation_id,
@@ -43,6 +53,7 @@ def add_status_history(db: Session, reservation_id: int, from_status: Optional[s
         to_status=to_status,
         operator_account=operator_account,
         operator_role=operator_role,
+        shelf_code_snapshot=shelf_code_snapshot,
         remark=remark,
     )
     db.add(history)
@@ -62,6 +73,54 @@ def require_librarian(role: str) -> Tuple[bool, Optional[str]]:
     if role != ROLE_LIBRARIAN:
         return False, ErrorCode.PERMISSION_DENIED
     return True, None
+
+
+def get_config_value(db: Session, config_key: str, default: Optional[str] = None) -> Optional[str]:
+    cfg = db.query(SystemConfig).filter(SystemConfig.config_key == config_key).first()
+    if cfg:
+        return cfg.config_value
+    return default
+
+
+def set_config_value(db: Session, config_key: str, config_value: str,
+                     description: Optional[str] = None) -> SystemConfig:
+    cfg = db.query(SystemConfig).filter(SystemConfig.config_key == config_key).first()
+    if cfg:
+        cfg.config_value = config_value
+        if description is not None:
+            cfg.description = description
+        cfg.updated_at = datetime.utcnow()
+    else:
+        cfg = SystemConfig(
+            config_key=config_key,
+            config_value=config_value,
+            description=description,
+        )
+        db.add(cfg)
+    db.flush()
+    return cfg
+
+
+def get_all_configs(db: Session) -> List[SystemConfig]:
+    return db.query(SystemConfig).order_by(SystemConfig.config_key.asc()).all()
+
+
+def ensure_default_configs(db: Session):
+    existing = get_config_value(db, DEFAULT_EXPIRE_HOURS_KEY)
+    if existing is None:
+        set_config_value(
+            db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS),
+            description="默认取书时限（小时），分配架位时 expire_hours 未指定时使用"
+        )
+        db.commit()
+
+
+def get_default_expire_hours(db: Session) -> int:
+    raw = get_config_value(db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS))
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return DEFAULT_EXPIRE_HOURS
 
 
 def import_reservations(db: Session, operator_account: str, operator_role: str,
@@ -102,7 +161,9 @@ def import_reservations(db: Session, operator_account: str, operator_role: str,
 
         add_status_history(
             db, reservation.id, None, "IMPORTED",
-            operator_account, operator_role, "导入预约"
+            operator_account, operator_role,
+            shelf_code_snapshot=None,
+            remark="导入预约"
         )
         write_audit(
             db, "IMPORT_RESERVATION", operator_account, operator_role,
@@ -124,7 +185,7 @@ def import_reservations(db: Session, operator_account: str, operator_role: str,
 
 def assign_shelf(db: Session, operator_account: str, operator_role: str,
                  barcode: str, shelf_code: str, pickup_window_id: Optional[int] = None,
-                 expire_hours: int = 48):
+                 expire_hours: Optional[int] = None):
     ok, err = validate_role(operator_role)
     if not ok:
         return {"code": err, "message": ERROR_MESSAGES[err], "data": None}
@@ -139,6 +200,21 @@ def assign_shelf(db: Session, operator_account: str, operator_role: str,
         )
         db.commit()
         return {"code": ErrorCode.BARCODE_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.BARCODE_NOT_FOUND], "data": None}
+
+    if reservation.status in ("PICKED_UP", "CANCELLED", "EXPIRED"):
+        write_audit(
+            db, "ASSIGN_SHELF", operator_account, operator_role,
+            "reservation", barcode,
+            {"barcode": barcode, "shelf_code": shelf_code},
+            "FAIL", ErrorCode.RESERVATION_ALREADY_FINAL,
+            ERROR_MESSAGES[ErrorCode.RESERVATION_ALREADY_FINAL]
+        )
+        db.commit()
+        return {
+            "code": ErrorCode.RESERVATION_ALREADY_FINAL,
+            "message": ERROR_MESSAGES[ErrorCode.RESERVATION_ALREADY_FINAL],
+            "data": None,
+        }
 
     shelf = db.query(ShelfRule).filter(ShelfRule.shelf_code == shelf_code, ShelfRule.is_active == True).first()
     if not shelf:
@@ -193,7 +269,11 @@ def assign_shelf(db: Session, operator_account: str, operator_role: str,
             db.commit()
             return {"code": ErrorCode.PICKUP_WINDOW_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.PICKUP_WINDOW_NOT_FOUND], "data": None}
 
+    if expire_hours is None:
+        expire_hours = get_default_expire_hours(db)
+
     old_status = reservation.status
+    old_shelf = reservation.shelf_code
     reservation.shelf_code = shelf_code
     reservation.pickup_window_id = pickup_window_id
     reservation.expire_at = datetime.utcnow() + timedelta(hours=expire_hours)
@@ -201,12 +281,14 @@ def assign_shelf(db: Session, operator_account: str, operator_role: str,
 
     add_status_history(
         db, reservation.id, old_status, "SHELF_ASSIGNED",
-        operator_account, operator_role, f"分配架位: {shelf_code}"
+        operator_account, operator_role,
+        shelf_code_snapshot=shelf_code,
+        remark=f"分配架位: {shelf_code} (原架位: {old_shelf or '无'}, 时限: {expire_hours}h)"
     )
     write_audit(
         db, "ASSIGN_SHELF", operator_account, operator_role,
         "reservation", barcode,
-        {"barcode": barcode, "shelf_code": shelf_code, "pickup_window_id": pickup_window_id},
+        {"barcode": barcode, "shelf_code": shelf_code, "pickup_window_id": pickup_window_id, "expire_hours": expire_hours},
         "SUCCESS"
     )
     db.commit()
@@ -252,7 +334,9 @@ def mark_ready_for_pickup(db: Session, operator_account: str, operator_role: str
 
     add_status_history(
         db, reservation.id, old_status, "READY_FOR_PICKUP",
-        operator_account, operator_role, "标记待取"
+        operator_account, operator_role,
+        shelf_code_snapshot=reservation.shelf_code,
+        remark="标记待取"
     )
     write_audit(
         db, "MARK_READY", operator_account, operator_role,
@@ -315,7 +399,9 @@ def confirm_picked_up(db: Session, operator_account: str, operator_role: str,
 
     add_status_history(
         db, reservation.id, old_status, "PICKED_UP",
-        operator_account, operator_role, f"馆员确认取走: {librarian_name}"
+        operator_account, operator_role,
+        shelf_code_snapshot=reservation.shelf_code,
+        remark=f"馆员确认取走: {librarian_name}"
     )
     write_audit(
         db, "CONFIRM_PICKUP", operator_account, operator_role,
@@ -349,7 +435,41 @@ def cancel_reservation(db: Session, operator_account: str, operator_role: str,
         db.commit()
         return {"code": ErrorCode.BARCODE_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.BARCODE_NOT_FOUND], "data": None}
 
-    if reservation.status in ("PICKED_UP", "CANCELLED", "EXPIRED"):
+    if operator_role == ROLE_ANONYMOUS:
+        write_audit(
+            db, "CANCEL_RESERVATION", operator_account, operator_role,
+            "reservation", barcode,
+            {"barcode": barcode, "cancel_reason": cancel_reason},
+            "FAIL", ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN,
+            ERROR_MESSAGES[ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN]
+        )
+        db.commit()
+        return {
+            "code": ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN,
+            "message": ERROR_MESSAGES[ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN],
+            "data": None,
+        }
+
+    if operator_role == ROLE_READER:
+        if operator_account != reservation.reader_account:
+            write_audit(
+                db, "CANCEL_RESERVATION", operator_account, operator_role,
+                "reservation", barcode,
+                {"barcode": barcode, "cancel_reason": cancel_reason},
+                "FAIL", ErrorCode.PERMISSION_NOT_OWNER,
+                f"{ERROR_MESSAGES[ErrorCode.PERMISSION_NOT_OWNER]}（预约所有者: {reservation.reader_account}，操作者: {operator_account}）"
+            )
+            db.commit()
+            return {
+                "code": ErrorCode.PERMISSION_NOT_OWNER,
+                "message": f"{ERROR_MESSAGES[ErrorCode.PERMISSION_NOT_OWNER]}（预约所有者: {reservation.reader_account}，操作者: {operator_account}）",
+                "data": None,
+            }
+        cancel_by = CANCEL_BY_SELF
+    else:
+        cancel_by = CANCEL_BY_LIBRARIAN
+
+    if reservation.status not in CANCELABLE_STATUSES:
         write_audit(
             db, "CANCEL_RESERVATION", operator_account, operator_role,
             "reservation", barcode,
@@ -367,17 +487,138 @@ def cancel_reservation(db: Session, operator_account: str, operator_role: str,
     old_status = reservation.status
     reservation.status = "CANCELLED"
     reservation.cancel_reason = cancel_reason
+    reservation.cancel_by_role = cancel_by
 
     add_status_history(
         db, reservation.id, old_status, "CANCELLED",
-        operator_account, operator_role, f"取消原因: {cancel_reason}"
+        operator_account, operator_role,
+        shelf_code_snapshot=reservation.shelf_code,
+        remark=f"取消原因: {cancel_reason}（取消方: {cancel_by}）"
     )
     write_audit(
         db, "CANCEL_RESERVATION", operator_account, operator_role,
         "reservation", barcode,
-        {"barcode": barcode, "cancel_reason": cancel_reason},
+        {"barcode": barcode, "cancel_reason": cancel_reason, "cancel_by": cancel_by},
         "SUCCESS"
     )
+    db.commit()
+    db.refresh(reservation)
+    return {
+        "code": ErrorCode.SUCCESS,
+        "message": ERROR_MESSAGES[ErrorCode.SUCCESS],
+        "data": {"reservation": reservation},
+    }
+
+
+def expire_reservation_internal(db: Session, reservation: Reservation,
+                                expire_reason: str, operator_account: str,
+                                operator_role: str) -> bool:
+    if reservation.status == "EXPIRED":
+        return False
+    if reservation.status not in ("SHELF_ASSIGNED", "READY_FOR_PICKUP"):
+        return False
+    if reservation.expire_at is None:
+        return False
+
+    now = datetime.utcnow()
+    if now < reservation.expire_at and expire_reason != EXPIRE_REASON_MANUAL:
+        return False
+
+    old_status = reservation.status
+    reservation.status = "EXPIRED"
+    reservation.expired_at = now
+    reservation.expire_reason = expire_reason
+
+    reason_desc = {
+        EXPIRE_REASON_TIMEOUT: "预约超过取书时限自动过期",
+        EXPIRE_REASON_STARTUP_SCAN: "服务启动扫描发现超时自动过期",
+        EXPIRE_REASON_MANUAL: "馆员手动标记过期",
+    }.get(expire_reason, "预约过期")
+
+    add_status_history(
+        db, reservation.id, old_status, "EXPIRED",
+        operator_account, operator_role,
+        shelf_code_snapshot=reservation.shelf_code,
+        remark=f"{reason_desc}（应取时间: {reservation.expire_at.isoformat()}）"
+    )
+    write_audit(
+        db, "EXPIRE_RESERVATION", operator_account, operator_role,
+        "reservation", reservation.barcode,
+        {"barcode": reservation.barcode, "expire_reason": expire_reason, "expire_at": reservation.expire_at.isoformat()},
+        "SUCCESS"
+    )
+    return True
+
+
+def scan_expired_reservations(db: Session, expire_reason: str = EXPIRE_REASON_STARTUP_SCAN,
+                              force: bool = False) -> dict:
+    query = db.query(Reservation).filter(
+        Reservation.status.in_(["SHELF_ASSIGNED", "READY_FOR_PICKUP"]),
+        Reservation.expire_at.isnot(None),
+    )
+    if not force:
+        query = query.filter(Reservation.expire_at <= datetime.utcnow())
+
+    candidates = query.all()
+    scanned_count = len(candidates)
+    expired_count = 0
+    details = []
+
+    for r in candidates:
+        ok = expire_reservation_internal(db, r, expire_reason, SYSTEM_OPERATOR_ACCOUNT, ROLE_LIBRARIAN)
+        if ok:
+            expired_count += 1
+            details.append({
+                "barcode": r.barcode,
+                "book_title": r.book_title,
+                "reader_account": r.reader_account,
+                "expire_at": r.expire_at.isoformat() if r.expire_at else None,
+                "shelf_code": r.shelf_code,
+            })
+
+    if expired_count > 0:
+        db.commit()
+
+    return {
+        "scanned_count": scanned_count,
+        "expired_count": expired_count,
+        "details": details,
+    }
+
+
+def manually_expire_reservation(db: Session, operator_account: str, operator_role: str,
+                                barcode: str):
+    ok, err = require_librarian(operator_role)
+    if not ok:
+        return {"code": err, "message": ERROR_MESSAGES[err], "data": None}
+
+    reservation = db.query(Reservation).filter(Reservation.barcode == barcode).first()
+    if not reservation:
+        write_audit(
+            db, "MANUAL_EXPIRE", operator_account, operator_role,
+            "reservation", barcode, {"barcode": barcode},
+            "FAIL", ErrorCode.BARCODE_NOT_FOUND, ERROR_MESSAGES[ErrorCode.BARCODE_NOT_FOUND]
+        )
+        db.commit()
+        return {"code": ErrorCode.BARCODE_NOT_FOUND, "message": ERROR_MESSAGES[ErrorCode.BARCODE_NOT_FOUND], "data": None}
+
+    ok_changed = expire_reservation_internal(
+        db, reservation, EXPIRE_REASON_MANUAL, operator_account, operator_role
+    )
+    if not ok_changed:
+        reason = f"当前状态 {reservation.status} 或 expire_at={reservation.expire_at} 不满足过期条件"
+        write_audit(
+            db, "MANUAL_EXPIRE", operator_account, operator_role,
+            "reservation", barcode, {"barcode": barcode},
+            "FAIL", ErrorCode.INVALID_STATUS_TRANSITION, reason
+        )
+        db.commit()
+        return {
+            "code": ErrorCode.INVALID_STATUS_TRANSITION,
+            "message": reason,
+            "data": None,
+        }
+
     db.commit()
     db.refresh(reservation)
     return {
@@ -406,9 +647,42 @@ def get_reservation_history(db: Session, barcode: str):
     }
 
 
-def get_all_audit_logs(db: Session):
-    logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).all()
-    return logs
+def query_reservations(db: Session, params: ReservationQueryParams) -> List[Reservation]:
+    q = db.query(Reservation)
+    if params.status:
+        q = q.filter(Reservation.status == params.status)
+    if params.reader_account:
+        q = q.filter(Reservation.reader_account == params.reader_account)
+    if params.shelf_code:
+        q = q.filter(Reservation.shelf_code == params.shelf_code)
+    if params.barcode:
+        q = q.filter(Reservation.barcode.like(f"%{params.barcode}%"))
+    if params.created_from:
+        q = q.filter(Reservation.created_at >= params.created_from)
+    if params.created_to:
+        q = q.filter(Reservation.created_at <= params.created_to)
+    return q.order_by(Reservation.created_at.desc()).all()
+
+
+def get_all_audit_logs(db: Session) -> List[AuditLog]:
+    return db.query(AuditLog).order_by(AuditLog.created_at.desc()).all()
+
+
+def query_audit_logs(db: Session, params: AuditQueryParams) -> List[AuditLog]:
+    q = db.query(AuditLog)
+    if params.action:
+        q = q.filter(AuditLog.action == params.action)
+    if params.operator_account:
+        q = q.filter(AuditLog.operator_account == params.operator_account)
+    if params.operator_role:
+        q = q.filter(AuditLog.operator_role == params.operator_role)
+    if params.response_status:
+        q = q.filter(AuditLog.response_status == params.response_status)
+    if params.created_from:
+        q = q.filter(AuditLog.created_at >= params.created_from)
+    if params.created_to:
+        q = q.filter(AuditLog.created_at <= params.created_to)
+    return q.order_by(AuditLog.created_at.desc()).all()
 
 
 def create_shelf_rule(db: Session, shelf_code: str, zone: str, row_no: int, col_no: int, description: Optional[str] = None):

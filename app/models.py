@@ -15,6 +15,26 @@ RESERVATION_STATUS = (
 
 ROLE_READER = "reader"
 ROLE_LIBRARIAN = "librarian"
+ROLE_ANONYMOUS = "anonymous"
+
+CANCEL_BY_SELF = "self"
+CANCEL_BY_LIBRARIAN = "librarian"
+CANCEL_BY_ANONYMOUS = "anonymous"
+
+EXPIRE_REASON_TIMEOUT = "EXPIRE_TIMEOUT"
+EXPIRE_REASON_STARTUP_SCAN = "EXPIRE_STARTUP_SCAN"
+EXPIRE_REASON_MANUAL = "EXPIRE_MANUAL"
+
+
+class SystemConfig(Base):
+    __tablename__ = "system_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_key = Column(String(100), unique=True, nullable=False, index=True)
+    config_value = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ShelfRule(Base):
@@ -54,7 +74,10 @@ class Reservation(Base):
     pickup_window_id = Column(Integer, ForeignKey("pickup_windows.id"), nullable=True)
     status = Column(String(30), nullable=False, default="IMPORTED")
     expire_at = Column(DateTime, nullable=True)
+    expired_at = Column(DateTime, nullable=True)
+    expire_reason = Column(String(100), nullable=True)
     cancel_reason = Column(Text, nullable=True)
+    cancel_by_role = Column(String(30), nullable=True)
     librarian_name = Column(String(200), nullable=True)
     picked_up_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -74,6 +97,7 @@ class StatusHistory(Base):
     to_status = Column(String(30), nullable=False)
     operator_account = Column(String(100), nullable=False)
     operator_role = Column(String(30), nullable=False)
+    shelf_code_snapshot = Column(String(50), nullable=True)
     remark = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -11,11 +11,15 @@ class ErrorCode:
     SHELF_ALREADY_OCCUPIED = "SHELF_ALREADY_OCCUPIED"
     INVALID_STATUS_TRANSITION = "INVALID_STATUS_TRANSITION"
     PERMISSION_DENIED = "PERMISSION_DENIED"
+    PERMISSION_NOT_OWNER = "PERMISSION_NOT_OWNER"
+    PERMISSION_ANONYMOUS_FORBIDDEN = "PERMISSION_ANONYMOUS_FORBIDDEN"
     INVALID_ROLE = "INVALID_ROLE"
     RESERVATION_NOT_FOUND = "RESERVATION_NOT_FOUND"
     VALIDATION_ERROR = "VALIDATION_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     PICKUP_WINDOW_NOT_FOUND = "PICKUP_WINDOW_NOT_FOUND"
+    CONFIG_NOT_FOUND = "CONFIG_NOT_FOUND"
+    RESERVATION_ALREADY_FINAL = "RESERVATION_ALREADY_FINAL"
 
 
 ERROR_MESSAGES = {
@@ -26,11 +30,15 @@ ERROR_MESSAGES = {
     ErrorCode.SHELF_ALREADY_OCCUPIED: "架位已被其他预约占用",
     ErrorCode.INVALID_STATUS_TRANSITION: "无效的状态流转",
     ErrorCode.PERMISSION_DENIED: "权限不足，仅馆员可执行此操作",
+    ErrorCode.PERMISSION_NOT_OWNER: "仅预约所属读者本人或馆员可取消此预约",
+    ErrorCode.PERMISSION_ANONYMOUS_FORBIDDEN: "匿名用户无权执行取消操作，请以读者或馆员身份登录",
     ErrorCode.INVALID_ROLE: "无效的角色标识",
     ErrorCode.RESERVATION_NOT_FOUND: "预约记录不存在",
     ErrorCode.VALIDATION_ERROR: "请求参数校验失败",
     ErrorCode.INTERNAL_ERROR: "服务器内部错误",
     ErrorCode.PICKUP_WINDOW_NOT_FOUND: "取书窗口不存在",
+    ErrorCode.CONFIG_NOT_FOUND: "配置项不存在",
+    ErrorCode.RESERVATION_ALREADY_FINAL: "预约已处于终态（已取走/已取消/已过期），无法变更",
 }
 
 
@@ -101,7 +109,7 @@ class ReservationAssignShelfRequest(BaseModel):
     barcode: str
     shelf_code: str
     pickup_window_id: Optional[int] = None
-    expire_hours: Optional[int] = 48
+    expire_hours: Optional[int] = None
 
 
 class ReservationUpdateStatusRequest(BaseModel):
@@ -110,6 +118,15 @@ class ReservationUpdateStatusRequest(BaseModel):
     barcode: str
     librarian_name: Optional[str] = None
     cancel_reason: Optional[str] = None
+
+
+class ReservationQueryParams(BaseModel):
+    status: Optional[str] = None
+    reader_account: Optional[str] = None
+    shelf_code: Optional[str] = None
+    barcode: Optional[str] = None
+    created_from: Optional[datetime] = None
+    created_to: Optional[datetime] = None
 
 
 class ReservationOut(BaseModel):
@@ -123,7 +140,10 @@ class ReservationOut(BaseModel):
     pickup_window_id: Optional[int]
     status: str
     expire_at: Optional[datetime]
+    expired_at: Optional[datetime]
+    expire_reason: Optional[str]
     cancel_reason: Optional[str]
+    cancel_by_role: Optional[str]
     librarian_name: Optional[str]
     picked_up_at: Optional[datetime]
     created_at: datetime
@@ -140,6 +160,7 @@ class StatusHistoryOut(BaseModel):
     to_status: str
     operator_account: str
     operator_role: str
+    shelf_code_snapshot: Optional[str]
     remark: Optional[str]
     created_at: datetime
 
@@ -167,3 +188,38 @@ class AuditLogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AuditQueryParams(BaseModel):
+    action: Optional[str] = None
+    operator_account: Optional[str] = None
+    operator_role: Optional[str] = None
+    response_status: Optional[str] = None
+    created_from: Optional[datetime] = None
+    created_to: Optional[datetime] = None
+
+
+class SystemConfigSetRequest(BaseModel):
+    operator_account: str
+    operator_role: str
+    config_key: str
+    config_value: str
+    description: Optional[str] = None
+
+
+class SystemConfigOut(BaseModel):
+    id: int
+    config_key: str
+    config_value: str
+    description: Optional[str]
+    updated_at: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ExpireScanResult(BaseModel):
+    scanned_count: int
+    expired_count: int
+    details: List[dict]
