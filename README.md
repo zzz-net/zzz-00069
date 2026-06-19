@@ -298,7 +298,7 @@ curl -s -X POST http://localhost:8000/api/reservations/confirm-pickup \
 
 ---
 
-### 8. 复现失败：非所有者取消被拒 + 匿名取消被拒（状态不变）
+### 8. 复现失败：非所有者取消被拒（状态不变）
 
 **读者 reader002 尝试取消 reader001 的 BK20260002：**
 
@@ -315,21 +315,6 @@ curl -s -X POST http://localhost:8000/api/reservations/cancel \
 
 预期：`code=PERMISSION_NOT_OWNER`，`message` 中明确写出"预约所有者: reader001，操作者: reader002"。
 
-**匿名用户尝试取消：**
-
-```bash
-curl -s -X POST http://localhost:8000/api/reservations/cancel \
-  -H "Content-Type: application/json" \
-  -d '{
-    "operator_account": "stranger",
-    "operator_role": "anonymous",
-    "barcode": "BK20260002",
-    "cancel_reason": "匿名取消"
-  }' | python -m json.tool
-```
-
-预期：`code=PERMISSION_ANONYMOUS_FORBIDDEN`。
-
 通过 history 验证**状态未被偷偷修改**：
 
 ```bash
@@ -337,6 +322,8 @@ curl -s http://localhost:8000/api/reservations/BK20260002/history | python -m js
 ```
 
 预期：BK20260002 仍为 `SHELF_ASSIGNED`，没有 CANCELLED 记录。
+
+匿名用户的所有写操作（含取消）已在步骤 7.5 中覆盖，返回 `PERMISSION_ANONYMOUS_FORBIDDEN`。
 
 ---
 
@@ -470,9 +457,10 @@ curl -s "http://localhost:8000/api/audit?operator_account=reader002" | python -m
 在筛选出的失败记录中应能看到：
 - `DUPLICATE_BARCODE`（重复导入）
 - `SHELF_ALREADY_OCCUPIED`（架位冲突）
-- `PERMISSION_DENIED`（读者冒充馆员取书）
+- `PERMISSION_DENIED`（读者冒充馆员取书 / 读者尝试分配架位或标记待取）
 - `PERMISSION_NOT_OWNER`（reader002 取消 reader001）
-- `PERMISSION_ANONYMOUS_FORBIDDEN`（匿名取消）
+- `PERMISSION_ANONYMOUS_FORBIDDEN`（匿名用户任何写操作：导入/分配/标记/确认/取消/改配置）
+- `VALIDATION_ERROR`（expire_hours ≤ 0）
 
 #### JSON 格式导出（支持同样的筛选参数）
 

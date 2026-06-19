@@ -364,16 +364,86 @@ check("D4 非法值被拒后状态最终正确", resp["data"]["reservation"]["st
       f"status={resp['data']['reservation']['status']}")
 
 # ----------------------------------------------------------
-# E. 版本号一致性
-print("\n--- E. 版本号一致性 ---")
+# E. 坏系统配置拦截
+print("\n--- E. 坏系统配置拦截 ---")
+
+# E1: default_expire_hours='abc'
+code, resp = req("POST", "/api/configs", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "config_key": "default_expire_hours",
+    "config_value": "abc"
+})
+check("E1 default_expire_hours='abc' 被拒", resp["code"] == "VALIDATION_ERROR",
+      f"code={resp['code']}, msg={resp.get('message','')}")
+
+# E2: default_expire_hours='-1'
+code, resp = req("POST", "/api/configs", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "config_key": "default_expire_hours",
+    "config_value": "-1"
+})
+check("E2 default_expire_hours='-1' 被拒", resp["code"] == "VALIDATION_ERROR",
+      f"code={resp['code']}, msg={resp.get('message','')}")
+
+# E3: default_expire_hours='0'
+code, resp = req("POST", "/api/configs", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "config_key": "default_expire_hours",
+    "config_value": "0"
+})
+check("E3 default_expire_hours='0' 被拒", resp["code"] == "VALIDATION_ERROR",
+      f"code={resp['code']}, msg={resp.get('message','')}")
+
+# E4: 合理值 '24' 成功
+code, resp = req("POST", "/api/configs", {
+    "operator_account": "librarian01",
+    "operator_role": "librarian",
+    "config_key": "default_expire_hours",
+    "config_value": "24"
+})
+check("E4 default_expire_hours='24' 成功", resp["code"] == "SUCCESS",
+      f"code={resp['code']}")
+
+# E5: 坏配置被拒后数据库值不变（仍是 24）
+code, resp = req("GET", "/api/configs")
+cfg_dict = {c["config_key"]: c["config_value"] for c in resp["data"]["configs"]}
+check("E5 坏配置被拒后 DB 仍为 24", cfg_dict.get("default_expire_hours") == "24",
+      f"actual={cfg_dict.get('default_expire_hours')}")
+
+# E6: 坏配置在 DB 中的自动修复 —— 直接把 DB 中 default_expire_hours 改成 '0'，然后重启
+print("  E6: 直接在 DB 中设置坏值 default_expire_hours='0'，重启后应自动修复")
+conn = sqlite3.connect(DB_PATH)
+conn.execute("UPDATE system_configs SET config_value='0' WHERE config_key='default_expire_hours'")
+conn.commit()
+cur = conn.execute("SELECT config_value FROM system_configs WHERE config_key='default_expire_hours'")
+print(f"    手动写入 DB: {cur.fetchone()[0]}")
+conn.close()
+
+print("  停止服务并重启...")
+stop_service(proc)
+time.sleep(1)
+proc = start_service()
+print(f"  服务已重启 (PID {proc.pid})")
+
+code, resp = req("GET", "/api/configs")
+cfg_dict = {c["config_key"]: c["config_value"] for c in resp["data"]["configs"]}
+check("E6 重启后坏值自动修复为 48", cfg_dict.get("default_expire_hours") == "48",
+      f"actual={cfg_dict.get('default_expire_hours')}")
+
+# ----------------------------------------------------------
+# F. 版本号一致性
+print("\n--- F. 版本号一致性 ---")
 
 code_root, resp_root = req("GET", "/")
 code_health, resp_health = req("GET", "/health")
-check("E1 根路径版本=1.1.0", resp_root.get("version") == "1.1.0",
+check("F1 根路径版本=1.1.0", resp_root.get("version") == "1.1.0",
       f"version={resp_root.get('version')}")
-check("E2 健康检查版本=1.1.0", resp_health.get("version") == "1.1.0",
+check("F2 健康检查版本=1.1.0", resp_health.get("version") == "1.1.0",
       f"version={resp_health.get('version')}")
-check("E3 两处版本一致", resp_root.get("version") == resp_health.get("version"))
+check("F3 两处版本一致", resp_root.get("version") == resp_health.get("version"))
 
 # ----------------------------------------------------------
 # 清理

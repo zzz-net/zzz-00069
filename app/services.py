@@ -93,8 +93,22 @@ def get_config_value(db: Session, config_key: str, default: Optional[str] = None
     return default
 
 
+def validate_config_value(config_key: str, config_value: str) -> Tuple[bool, Optional[str], Optional[str]]:
+    if config_key == DEFAULT_EXPIRE_HOURS_KEY:
+        try:
+            val = int(config_value)
+        except (ValueError, TypeError):
+            return False, ErrorCode.VALIDATION_ERROR, "default_expire_hours 必须是正整数"
+        if val <= 0:
+            return False, ErrorCode.VALIDATION_ERROR, "default_expire_hours 必须大于 0"
+    return True, None, None
+
+
 def set_config_value(db: Session, config_key: str, config_value: str,
                      description: Optional[str] = None) -> SystemConfig:
+    ok, err, msg = validate_config_value(config_key, config_value)
+    if not ok:
+        raise ValueError(msg or ERROR_MESSAGES.get(err, "配置值非法"))
     cfg = db.query(SystemConfig).filter(SystemConfig.config_key == config_key).first()
     if cfg:
         cfg.config_value = config_value
@@ -124,12 +138,23 @@ def ensure_default_configs(db: Session):
             description="默认取书时限（小时），分配架位时 expire_hours 未指定时使用"
         )
         db.commit()
+    else:
+        ok, _, _ = validate_config_value(DEFAULT_EXPIRE_HOURS_KEY, existing)
+        if not ok:
+            set_config_value(
+                db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS),
+                description="默认取书时限（小时），分配架位时 expire_hours 未指定时使用"
+            )
+            db.commit()
 
 
 def get_default_expire_hours(db: Session) -> int:
     raw = get_config_value(db, DEFAULT_EXPIRE_HOURS_KEY, str(DEFAULT_EXPIRE_HOURS))
     try:
-        return max(1, int(raw))
+        val = int(raw)
+        if val <= 0:
+            return DEFAULT_EXPIRE_HOURS
+        return val
     except Exception:
         return DEFAULT_EXPIRE_HOURS
 

@@ -44,11 +44,16 @@ def seed_initial_data(db: Session):
 
 
 def run_startup_tasks():
-    db = SessionLocal()
+    db_seed = SessionLocal()
     try:
-        seed_initial_data(db)
+        seed_initial_data(db_seed)
+    finally:
+        db_seed.close()
+
+    db_scan = SessionLocal()
+    try:
         scan_result = services.scan_expired_reservations(
-            db, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
+            db_scan, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
         )
         if scan_result["expired_count"] > 0:
             print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，回收 {scan_result['expired_count']} 条已过期预约", flush=True)
@@ -58,7 +63,7 @@ def run_startup_tasks():
             print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，未发现需回收的过期预约", flush=True)
         return scan_result
     finally:
-        db.close()
+        db_scan.close()
 
 
 @asynccontextmanager
@@ -159,7 +164,19 @@ def set_config(data: schemas.SystemConfigSetRequest, db: Session = Depends(get_d
         return JSONResponse(status_code=400, content={
             "code": err, "message": schemas.ERROR_MESSAGES.get(err, "未知错误"), "data": None
         })
-    cfg = services.set_config_value(db, data.config_key, data.config_value, data.description)
+    try:
+        cfg = services.set_config_value(db, data.config_key, data.config_value, data.description)
+    except ValueError as ve:
+        services.write_audit(
+            db, "SET_CONFIG", data.operator_account, data.operator_role,
+            "config", data.config_key,
+            {"config_key": data.config_key, "config_value": data.config_value},
+            "FAIL", schemas.ErrorCode.VALIDATION_ERROR, str(ve)
+        )
+        db.commit()
+        return JSONResponse(status_code=400, content={
+            "code": schemas.ErrorCode.VALIDATION_ERROR, "message": str(ve), "data": None
+        })
     db.commit()
     db.refresh(cfg)
     services.write_audit(
