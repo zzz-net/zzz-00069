@@ -55,6 +55,14 @@ def run_startup_tasks():
         scan_result = services.scan_expired_reservations(
             db_scan, expire_reason=models.EXPIRE_REASON_STARTUP_SCAN, force=False
         )
+        services.write_audit(
+            db_scan, "SCAN_EXPIRED", services.SYSTEM_OPERATOR_ACCOUNT, models.ROLE_LIBRARIAN,
+            "system", None,
+            {"trigger": "startup", "scanned_count": scan_result["scanned_count"],
+             "expired_count": scan_result["expired_count"]},
+            "SUCCESS"
+        )
+        db_scan.commit()
         if scan_result["expired_count"] > 0:
             print(f"[启动扫描] 发现 {scan_result['scanned_count']} 条待查记录，回收 {scan_result['expired_count']} 条已过期预约", flush=True)
             for d in scan_result["details"]:

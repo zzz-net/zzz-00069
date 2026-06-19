@@ -282,6 +282,14 @@ startup_expires = [a for a in expire_audits
 check("B7 审计有启动扫描过期记录", len(startup_expires) >= 1,
       f"count={len(startup_expires)}")
 
+# B8: 审计有 SCAN_EXPIRED 启动记录 (trigger=startup)
+code, resp = req("GET", "/api/audit?action=SCAN_EXPIRED")
+scan_audits = resp["data"]["audit_logs"]
+startup_scans = [a for a in scan_audits
+                 if a.get("request_data") and '"startup"' in (a["request_data"] or "")]
+check("B8 审计有 SCAN_EXPIRED 启动记录", len(startup_scans) >= 1,
+      f"count={len(startup_scans)}")
+
 # ----------------------------------------------------------
 print("\n--- C. 历史与审计输出一致 ---")
 

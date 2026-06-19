@@ -28,10 +28,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - Swagger 文档：<http://localhost:8000/docs>
 - 数据库文件：项目根目录 `library.db`
 
-一键运行完整测试（含所有断言）：
+一键运行完整回归测试（含匿名越权 / 真实重启过期 / 历史审计一致 / 参数校验 / 坏配置拦截 / 版本一致性）：
 
 ```bash
-python test_flow.py
+python test_regression.py
 ```
 
 ## 角色定义
@@ -68,7 +68,7 @@ SHELF_ASSIGNED / READY_FOR_PICKUP
 | `INVALID_STATUS_TRANSITION` | 400 | 无效的状态流转 |
 | `PERMISSION_DENIED` | 400 | 专属馆员权限不足（如确认取走） |
 | `PERMISSION_NOT_OWNER` | 400 | 读者取消他人预约：`预约所有者: xxx，操作者: yyy` |
-| `PERMISSION_ANONYMOUS_FORBIDDEN` | 400 | 匿名用户无权执行取消 |
+| `PERMISSION_ANONYMOUS_FORBIDDEN` | 400 | 匿名用户无权执行此操作，请以读者或馆员身份登录 |
 | `INVALID_ROLE` | 400 | 角色标识无效（非 reader/librarian/anonymous） |
 | `RESERVATION_NOT_FOUND` | 404 | 预约记录不存在 |
 | `VALIDATION_ERROR` | 400 | 参数校验失败 |
